@@ -2,12 +2,12 @@
   "domain": "ykk_door",
   "name": "YKK Smart Control Key",
   "version": "0.1.0",
-  "codeowners": [],
+  "codeowners": ["@rokusei"],
   "config_flow": true,
   "dependencies": ["bluetooth"],
-  "documentation": "https://github.com/example/ykk_door",
+  "documentation": "https://github.com/rokusei/ha-ykk-door",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/example/ykk_door/issues",
+  "issue_tracker": "https://github.com/rokusei/ha-ykk-door/issues",
   "requirements": [],
   "bluetooth": [
     {
