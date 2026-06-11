@@ -1,3 +1,5 @@
+> 🇯🇵 [日本語版はこちら](README.ja.md)
+
 # YKK Smart Control Key — Home Assistant integration
 
 Home Assistant custom integration for the YKK AP **Smart Control Key**
