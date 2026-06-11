@@ -132,7 +132,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
-        return SCKOptionsFlow(config_entry)
+        return SCKOptionsFlow()
 
     # --- discovery -------------------------------------------------------
     async def async_step_bluetooth(
@@ -403,10 +403,12 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class SCKOptionsFlow(OptionsFlow):
-    """Lets the user repick scanner sources after install."""
+    """Lets the user repick scanner sources after install.
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        self.config_entry = config_entry
+    ``self.config_entry`` is supplied by the OptionsFlow base class in
+    current HA versions and is a read-only property — do not assign to it
+    or override ``__init__`` to accept it.
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
