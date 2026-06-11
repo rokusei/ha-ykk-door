@@ -40,7 +40,7 @@ from .const import (
     DOMAIN,
     SOURCE_AUTO,
 )
-from .sckey.advertising import DecodedAdv, LockedState, decode_advertisement
+from .sckey.advertising import COMPANY_ID, DecodedAdv, LockedState, decode_advertisement
 from .sckey.client import LockState, SCKClient
 from .sckey.transport import SCKTransport
 
@@ -81,13 +81,27 @@ class SCKCoordinator:
     async def async_start(self) -> None:
         """Register passive bluetooth listener.
 
-        We register against ``connectable=False`` so non-connectable scanners
-        (a stretched-range proxy, etc.) can still feed us state.
+        We match on the SCK manufacturer company ID (0x099D) rather than on a
+        BLE address. SCK locks advertise with a **Random Private Address**
+        that rotates roughly every 15 minutes; an address matcher only fires
+        for the cached primer advert and then never again because each new
+        RPA looks like a new device to HA's bluetooth manager.
+
+        RPA→identity resolution requires an OS-level BLE bond, which only
+        happens when the user goes through the live-registration flow.
+        Manual-entry users have no bond, so address matching is unusable for
+        them. Matching on manufacturer ID sidesteps the problem entirely;
+        adverts from other people's SCK locks (vanishingly unlikely but
+        possible in apartments) are filtered out by the decoder, since they
+        won't decrypt cleanly with our per-lock AdvDataKey.
+
+        ``connectable=False`` keeps non-connectable scanners (a stretched-
+        range proxy etc.) in the eligible set.
         """
         self._unsub = bluetooth.async_register_callback(
             self.hass,
             self._on_adv,
-            {"address": self.address, "connectable": False},
+            {"manufacturer_id": COMPANY_ID, "connectable": False},
             bluetooth.BluetoothScanningMode.PASSIVE,
         )
 
@@ -114,10 +128,24 @@ class SCKCoordinator:
                 service_info.manufacturer_data, self._adv_key
             )
         except ValueError as err:
-            _LOGGER.debug("Failed to decode SCK adv from %s: %s", self.address, err)
+            # Wrong key / checksum mismatch — almost certainly someone else's
+            # SCK lock advertising on the same manufacturer ID. Silently skip.
+            _LOGGER.debug(
+                "Adv from %s did not decrypt with our key: %s",
+                service_info.address,
+                err,
+            )
             return
         if decoded is None:
             return
+        # If multiple SCK locks are configured (or a neighbour's lock happens
+        # to share an unrelated AdvDataKey collision), only accept adverts
+        # whose decoded lock_id matches the one stored at registration.
+        if decoded.lock_id != self.lock_id:
+            return
+        # Track the current RPA so the GATT path uses the live address, not
+        # whatever address was around at config-flow time.
+        self.address = service_info.address
         self.latest = decoded
         self.last_rssi = service_info.rssi
         self.last_source = service_info.source
