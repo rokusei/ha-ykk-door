@@ -17,6 +17,23 @@
           "short_range_source": "Short-range adapter (lock / unlock)"
         }
       },
+      "method": {
+        "title": "Registration method",
+        "description": "**Live registration** runs the full BLE handshake with the lock to capture this lock's unique advertising key. It requires a connectable Bluetooth scanner within ~3 m of the lock, and the lock to be in registration mode (physical button).\n\n**Manual entry** is for users who already have the `AdvDataKey` extracted by other means (e.g. reverse engineering). It skips the GATT round-trip entirely.",
+        "data": {
+          "method": "Method"
+        }
+      },
+      "manual": {
+        "title": "Manual credential entry",
+        "description": "Paste the values you already extracted for `{address}`.\n\n- **AdvDataKey** — 32 hex characters (16 bytes), with or without colons / spaces.\n- **Lock ID** — 9-character ASCII identifier the lock embeds in `SetLockCommand` (e.g. `2024A0010001`-style).\n- **PIN** — 6 digits. Required to authenticate `lock` / `unlock` actions over GATT.",
+        "data": {
+          "adv_data_key": "AdvDataKey (32 hex chars)",
+          "lock_id": "Lock ID (9 chars)",
+          "pin": "PIN (6 digits)",
+          "name": "Smartphone name shown on the lock"
+        }
+      },
       "register": {
         "title": "Register with the lock",
         "description": "About to register with **{name}** (`{address}`).\n\n1. Walk up to the lock so the Home Assistant Bluetooth adapter (or a nearby `bluetooth_proxy`) has line-of-sight (under ~3 m).\n2. **Press and hold the physical registration button on the lock** until it enters registration mode.\n3. Choose a 6-digit PIN below, then submit immediately — the lock leaves registration mode after a short window.\n\nThe handshake captures this lock's unique advertising key; without it, ongoing state cannot be decoded.",
@@ -34,6 +51,10 @@
     "error": {
       "registration_failed": "Registration failed. Make sure the lock is in registration mode (physical button) and try again.",
       "timeout": "The lock did not respond in time. Move closer and retry while the lock is in registration mode.",
+      "invalid_hex": "Not valid hexadecimal — strip any 0x prefix and use only 0-9 / a-f.",
+      "wrong_length": "Must be exactly 16 bytes (32 hex characters).",
+      "invalid_lock_id": "Must be exactly 9 ASCII characters.",
+      "invalid_pin": "Must be exactly 6 digits.",
       "unknown": "Unexpected error — check the Home Assistant logs."
     }
   },

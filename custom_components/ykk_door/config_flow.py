@@ -173,7 +173,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._long_source = user_input[CONF_LONG_RANGE_SOURCE]
             self._short_source = user_input[CONF_SHORT_RANGE_SOURCE]
-            return await self.async_step_register()
+            return await self.async_step_method()
 
         long_choices = _scanner_choices(self.hass, self._address, connectable=False)
         short_choices = _scanner_choices(self.hass, self._address, connectable=True)
@@ -189,6 +189,101 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                     ): vol.In(short_choices),
                 }
             ),
+            description_placeholders={"address": self._address},
+        )
+
+    # --- method picker (live registration vs manual key entry) ----------
+    async def async_step_method(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Choose between a live GATT registration and pasting credentials.
+
+        Live registration only works when a connectable scanner is within
+        ~3 m of the lock and the lock is in registration mode. For users
+        who already have a lock's per-device ``AdvDataKey`` (e.g. extracted
+        during reverse engineering), the manual path skips the GATT trip
+        entirely and gets you straight to a working read-only entity —
+        useful while waiting for a near-door ESP32 ``bluetooth_proxy`` to
+        be installed.
+        """
+        if user_input is not None:
+            if user_input["method"] == "manual":
+                return await self.async_step_manual()
+            return await self.async_step_register()
+        return self.async_show_form(
+            step_id="method",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("method", default="register"): vol.In(
+                        {
+                            "register": "Live registration (lock must be in registration mode)",
+                            "manual": "Manual entry (I already have the AdvDataKey)",
+                        }
+                    ),
+                }
+            ),
+        )
+
+    # --- manual entry (expert mode) -------------------------------------
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Accept the user-supplied AdvDataKey + lock_id + PIN directly.
+
+        Lock and unlock commands still require a connectable short-range
+        scanner at runtime; if none is configured yet, the read-only state
+        entity will still work — actions will simply error with
+        "not reachable" until a near-door scanner comes online.
+        """
+        errors: dict[str, str] = {}
+        assert self._address is not None
+
+        if user_input is not None:
+            raw_key = user_input[CONF_ADV_DATA_KEY].replace(":", "").replace(" ", "")
+            try:
+                adv_key = bytes.fromhex(raw_key)
+            except ValueError:
+                errors[CONF_ADV_DATA_KEY] = "invalid_hex"
+                adv_key = b""
+            if not errors and len(adv_key) != 16:
+                errors[CONF_ADV_DATA_KEY] = "wrong_length"
+
+            lock_id = user_input[CONF_LOCK_ID].strip()
+            if len(lock_id) != 9 or not lock_id.isascii():
+                errors[CONF_LOCK_ID] = "invalid_lock_id"
+
+            pin = user_input[CONF_PIN]
+            if not pin.isdigit() or len(pin) != 6:
+                errors[CONF_PIN] = "invalid_pin"
+
+            if not errors:
+                return self.async_create_entry(
+                    title=f"YKK Lock {lock_id}",
+                    data={
+                        CONF_ADDRESS: self._address,
+                        CONF_PIN: pin,
+                        CONF_NAME: user_input.get(CONF_NAME, DEFAULT_NAME),
+                        CONF_LOCK_ID: lock_id,
+                        CONF_ADV_DATA_KEY: adv_key.hex(),
+                        CONF_SMARTPHONE_ID: "",
+                    },
+                    options={
+                        CONF_LONG_RANGE_SOURCE: self._long_source,
+                        CONF_SHORT_RANGE_SOURCE: self._short_source,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="manual",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ADV_DATA_KEY): str,
+                    vol.Required(CONF_LOCK_ID): str,
+                    vol.Required(CONF_PIN, default="111111"): str,
+                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
+                }
+            ),
+            errors=errors,
             description_placeholders={"address": self._address},
         )
 
