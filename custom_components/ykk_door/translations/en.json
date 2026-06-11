@@ -26,9 +26,9 @@
       },
       "manual": {
         "title": "Manual credential entry",
-        "description": "Paste the values you already extracted for `{address}`.\n\n- **AdvDataKey** — 32 hex characters (16 bytes), with or without colons / spaces.\n- **Lock ID** — 9-character ASCII identifier the lock embeds in `SetLockCommand` (e.g. `2024A0010001`-style).\n- **PIN** — 6 digits. Required to authenticate `lock` / `unlock` actions over GATT.",
+        "description": "Paste the values you already extracted for `{address}`.\n\n- **AdvDataKey** — 16 bytes. Either as 32 hex characters (separators ignored) **or** as the raw 16-byte ASCII string the lock generated.\n- **Lock ID** — 9-character ASCII identifier the lock embeds in `SetLockCommand` (e.g. `2024A0010001`-style).\n- **PIN** — 6 digits. Required to authenticate `lock` / `unlock` actions over GATT.",
         "data": {
-          "adv_data_key": "AdvDataKey (32 hex chars)",
+          "adv_data_key": "AdvDataKey (32 hex chars or 16-byte ASCII)",
           "lock_id": "Lock ID (9 chars)",
           "pin": "PIN (6 digits)",
           "name": "Smartphone name shown on the lock"
@@ -51,8 +51,7 @@
     "error": {
       "registration_failed": "Registration failed. Make sure the lock is in registration mode (physical button) and try again.",
       "timeout": "The lock did not respond in time. Move closer and retry while the lock is in registration mode.",
-      "invalid_hex": "Not valid hexadecimal — strip any 0x prefix and use only 0-9 / a-f.",
-      "wrong_length": "Must be exactly 16 bytes (32 hex characters).",
+      "wrong_length": "Must be exactly 16 bytes — either 32 hex characters, or a 16-character raw ASCII string.",
       "invalid_lock_id": "Must be exactly 9 ASCII characters.",
       "invalid_pin": "Must be exactly 6 digits.",
       "unknown": "Unexpected error — check the Home Assistant logs."

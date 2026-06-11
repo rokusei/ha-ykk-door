@@ -77,6 +77,27 @@ def _is_sck(service_info: BluetoothServiceInfoBleak) -> bool:
     return (service_info.name or "").upper().startswith("SCK")
 
 
+def _parse_adv_data_key(raw: str) -> bytes | None:
+    """Accept either 32 hex chars (separators allowed) or 16 ASCII bytes.
+
+    Returns the 16-byte key, or ``None`` on parse failure. Hex form wins
+    when the input has no whitespace/separators and is exactly 32 hex
+    chars; otherwise we fall back to raw bytes if the input encodes to
+    exactly 16 bytes.
+    """
+    stripped = "".join(c for c in raw if c not in " :-")
+    try:
+        candidate = bytes.fromhex(stripped)
+        if len(candidate) == 16:
+            return candidate
+    except ValueError:
+        pass
+    encoded = raw.encode("utf-8")
+    if len(encoded) == 16:
+        return encoded
+    return None
+
+
 def _scanner_choices(
     hass: HomeAssistant, address: str, *, connectable: bool
 ) -> dict[str, str]:
@@ -239,14 +260,10 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._address is not None
 
         if user_input is not None:
-            raw_key = user_input[CONF_ADV_DATA_KEY].replace(":", "").replace(" ", "")
-            try:
-                adv_key = bytes.fromhex(raw_key)
-            except ValueError:
-                errors[CONF_ADV_DATA_KEY] = "invalid_hex"
-                adv_key = b""
-            if not errors and len(adv_key) != 16:
+            adv_key = _parse_adv_data_key(user_input[CONF_ADV_DATA_KEY])
+            if adv_key is None:
                 errors[CONF_ADV_DATA_KEY] = "wrong_length"
+                adv_key = b""
 
             lock_id = user_input[CONF_LOCK_ID].strip()
             if len(lock_id) != 9 or not lock_id.isascii():
