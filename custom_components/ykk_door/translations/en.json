@@ -1,0 +1,63 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Pick a YKK SCK lock",
+        "description": "Choose the lock you want to add. Only locks currently broadcasting BLE adverts visible to Home Assistant are listed.",
+        "data": {
+          "address": "Bluetooth address"
+        }
+      },
+      "adapters": {
+        "title": "Pick Bluetooth adapters for each role",
+        "description": "**Long-range** (read-only): scanner used to listen for the lock's state broadcasts. Any scanner that hears the lock will do — pick one with a stable signal.\n\n**Short-range** (read/write): scanner used to send lock / unlock commands. Must be physically close to the lock (≤ ~3 m) to bond reliably. Typically the ESPHome `bluetooth_proxy` near the door.\n\nLeave either as **Auto** if you only have one adapter today, or want HA to pick the best available scanner.",
+        "data": {
+          "long_range_source": "Long-range adapter (state)",
+          "short_range_source": "Short-range adapter (lock / unlock)"
+        }
+      },
+      "register": {
+        "title": "Register with the lock",
+        "description": "About to register with **{name}** (`{address}`).\n\n1. Walk up to the lock so the Home Assistant Bluetooth adapter (or a nearby `bluetooth_proxy`) has line-of-sight (under ~3 m).\n2. **Press and hold the physical registration button on the lock** until it enters registration mode.\n3. Choose a 6-digit PIN below, then submit immediately — the lock leaves registration mode after a short window.\n\nThe handshake captures this lock's unique advertising key; without it, ongoing state cannot be decoded.",
+        "data": {
+          "pin": "PIN (6 digits)",
+          "name": "Smartphone name shown on the lock"
+        }
+      }
+    },
+    "abort": {
+      "no_devices_found": "No YKK SCK locks are currently advertising. Make sure HA's Bluetooth adapter (or a bluetooth_proxy) is close enough to the lock.",
+      "already_configured": "This lock is already configured.",
+      "unsupported_platform": "Home Assistant is running on a platform the underlying Bleak library does not support (Android). Use a Linux/macOS/Windows host or an ESPHome bluetooth_proxy."
+    },
+    "error": {
+      "registration_failed": "Registration failed. Make sure the lock is in registration mode (physical button) and try again.",
+      "timeout": "The lock did not respond in time. Move closer and retry while the lock is in registration mode.",
+      "unknown": "Unexpected error — check the Home Assistant logs."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Bluetooth adapters",
+        "description": "Pick which scanner handles each role. Scanners currently seeing the lock are listed by RSSI; sources you previously selected remain selectable even when not currently visible.",
+        "data": {
+          "long_range_source": "Long-range adapter (state)",
+          "short_range_source": "Short-range adapter (lock / unlock)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "low_battery": { "name": "Low battery" },
+      "inspection_due": { "name": "Inspection due" }
+    },
+    "sensor": {
+      "lock_unit_fw": { "name": "Lock-unit firmware" },
+      "handle_unit_fw": { "name": "Handle-unit firmware" },
+      "rssi": { "name": "Signal strength" }
+    }
+  }
+}

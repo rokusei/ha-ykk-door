@@ -1,0 +1,333 @@
+"""Config flow for YKK Smart Control Key.
+
+Four-step setup:
+
+1. **bluetooth discovery / user pick** — HA's bluetooth integration
+   auto-discovers SCK adverts by service UUID and invokes
+   ``async_step_bluetooth``; the manual flow lists nearby SCK devices.
+2. **adapters** — choose which scanner handles the long-range
+   (state-listening) role and which handles the short-range (GATT
+   read/write) role. Each defaults to ``auto``. You don't have to commit
+   to a specific scanner here — the options flow lets you change later
+   (e.g. once an ESPHome ``bluetooth_proxy`` near the door comes online).
+3. **register** — user picks a PIN (will be set on the lock), then is told
+   to press the physical button on the lock to enter registration mode.
+   Submitting runs the GATT registration handshake — this is what captures
+   the per-lock ``AdvDataKey`` the integration needs to decode adverts.
+4. (config entry created)
+
+The underlying sckey library uses bleak, which has no Android backend. We
+guard against running on Android and surface a clear error; HA Core itself
+doesn't run on Android, but the guard documents the constraint and protects
+unusual install paths.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth import (
+    BluetoothServiceInfoBleak,
+    async_discovered_service_info,
+)
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import HomeAssistant, callback
+
+from .const import (
+    CONF_ADDRESS,
+    CONF_ADV_DATA_KEY,
+    CONF_LOCK_ID,
+    CONF_LONG_RANGE_SOURCE,
+    CONF_NAME,
+    CONF_PIN,
+    CONF_SHORT_RANGE_SOURCE,
+    CONF_SMARTPHONE_ID,
+    DEFAULT_NAME,
+    DOMAIN,
+    SOURCE_AUTO,
+)
+from .sckey.advertising import COMPANY_ID
+from .sckey.client import SCKClient
+from .sckey.frames import SERVICE_UUID
+from .sckey.transport import SCKTransport
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_android() -> bool:
+    """sckey -> bleak has no Android backend. Refuse setup if we're on it."""
+    return hasattr(sys, "getandroidapilevel")
+
+
+def _is_sck(service_info: BluetoothServiceInfoBleak) -> bool:
+    if SERVICE_UUID in service_info.service_uuids:
+        return True
+    if COMPANY_ID in service_info.manufacturer_data:
+        return True
+    return (service_info.name or "").upper().startswith("SCK")
+
+
+def _scanner_choices(
+    hass: HomeAssistant, address: str, *, connectable: bool
+) -> dict[str, str]:
+    """Build a {source: label} mapping of scanners currently seeing `address`.
+
+    ``connectable=True`` for the short-range role (only connectable scanners
+    can do GATT); ``connectable=False`` for the long-range role (any scanner
+    that hears the advert is fine).
+    """
+    choices: dict[str, str] = {SOURCE_AUTO: "Auto (best available)"}
+    for sd in bluetooth.async_scanner_devices_by_address(
+        hass, address, connectable=connectable
+    ):
+        rssi = sd.advertisement_data.rssi
+        choices[sd.scanner.source] = (
+            f"{sd.scanner.name} [{sd.scanner.source}]  {rssi} dBm"
+        )
+    return choices
+
+
+class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a YKK SCK config flow."""
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        self._discovered: dict[str, BluetoothServiceInfoBleak] = {}
+        self._address: str | None = None
+        self._long_source: str = SOURCE_AUTO
+        self._short_source: str = SOURCE_AUTO
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return SCKOptionsFlow(config_entry)
+
+    # --- discovery -------------------------------------------------------
+    async def async_step_bluetooth(
+        self, discovery_info: BluetoothServiceInfoBleak
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by bluetooth discovery."""
+        if _is_android():
+            return self.async_abort(reason="unsupported_platform")
+        await self.async_set_unique_id(discovery_info.address)
+        self._abort_if_unique_id_configured()
+        self._discovered[discovery_info.address] = discovery_info
+        self._address = discovery_info.address
+        self.context["title_placeholders"] = {
+            "name": discovery_info.name or "SCK lock"
+        }
+        return await self.async_step_adapters()
+
+    # --- manual user start ----------------------------------------------
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick an SCK lock from current bluetooth adverts."""
+        if _is_android():
+            return self.async_abort(reason="unsupported_platform")
+
+        if user_input is not None:
+            self._address = user_input[CONF_ADDRESS]
+            await self.async_set_unique_id(self._address, raise_on_progress=False)
+            self._abort_if_unique_id_configured()
+            return await self.async_step_adapters()
+
+        current_ids = {
+            entry.unique_id for entry in self._async_current_entries(include_ignore=True)
+        }
+        for info in async_discovered_service_info(self.hass, connectable=False):
+            if info.address in current_ids:
+                continue
+            if _is_sck(info):
+                self._discovered[info.address] = info
+
+        if not self._discovered:
+            return self.async_abort(reason="no_devices_found")
+
+        choices = {
+            addr: f"{info.name or 'SCK'} ({addr})"
+            for addr, info in self._discovered.items()
+        }
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({vol.Required(CONF_ADDRESS): vol.In(choices)}),
+        )
+
+    # --- adapter selection ----------------------------------------------
+    async def async_step_adapters(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick which scanner handles long-range vs short-range roles."""
+        assert self._address is not None
+        if user_input is not None:
+            self._long_source = user_input[CONF_LONG_RANGE_SOURCE]
+            self._short_source = user_input[CONF_SHORT_RANGE_SOURCE]
+            return await self.async_step_register()
+
+        long_choices = _scanner_choices(self.hass, self._address, connectable=False)
+        short_choices = _scanner_choices(self.hass, self._address, connectable=True)
+        return self.async_show_form(
+            step_id="adapters",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_LONG_RANGE_SOURCE, default=SOURCE_AUTO
+                    ): vol.In(long_choices),
+                    vol.Required(
+                        CONF_SHORT_RANGE_SOURCE, default=SOURCE_AUTO
+                    ): vol.In(short_choices),
+                }
+            ),
+            description_placeholders={"address": self._address},
+        )
+
+    # --- registration ----------------------------------------------------
+    async def async_step_register(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Run the GATT registration handshake to capture the AdvDataKey.
+
+        The lock must be in registration mode (press the physical button on
+        the unit) for this to succeed.
+        """
+        errors: dict[str, str] = {}
+        assert self._address is not None
+
+        if user_input is not None:
+            pin = user_input[CONF_PIN]
+            name = user_input.get(CONF_NAME, DEFAULT_NAME)
+            try:
+                result = await self._run_registration(pin, name)
+            except TimeoutError:
+                errors["base"] = "timeout"
+            except RuntimeError as err:
+                _LOGGER.exception("SCK registration failed: %s", err)
+                errors["base"] = "registration_failed"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error during SCK registration")
+                errors["base"] = "unknown"
+            else:
+                return self.async_create_entry(
+                    title=f"YKK Lock {result['lock_id']}",
+                    data={
+                        CONF_ADDRESS: self._address,
+                        CONF_PIN: pin,
+                        CONF_NAME: name,
+                        CONF_LOCK_ID: result["lock_id"],
+                        CONF_ADV_DATA_KEY: result["adv_data_key"],
+                        CONF_SMARTPHONE_ID: result["smartphone_id"],
+                    },
+                    options={
+                        CONF_LONG_RANGE_SOURCE: self._long_source,
+                        CONF_SHORT_RANGE_SOURCE: self._short_source,
+                    },
+                )
+
+        info = self._discovered.get(self._address)
+        return self.async_show_form(
+            step_id="register",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PIN, default="111111"): str,
+                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
+                }
+            ),
+            description_placeholders={
+                "address": self._address,
+                "name": (info.name if info else None) or "SCK lock",
+            },
+            errors=errors,
+        )
+
+    async def _run_registration(self, pin: str, name: str) -> dict[str, str]:
+        """Open a GATT connection (over the chosen short-range scanner) and
+        run the registration handshake.
+
+        Returns plain-str fields suitable for storing in the config entry.
+        """
+        if not pin.isdigit() or len(pin) != 6:
+            raise RuntimeError("PIN must be exactly 6 digits")
+
+        ble_device = None
+        if self._short_source == SOURCE_AUTO:
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self._address, connectable=True
+            )
+        else:
+            for sd in bluetooth.async_scanner_devices_by_address(
+                self.hass, self._address, connectable=True
+            ):
+                if sd.scanner.source == self._short_source:
+                    ble_device = sd.ble_device
+                    break
+
+        if ble_device is None:
+            raise RuntimeError(
+                "Lock is not currently reachable for a GATT connection on the "
+                "selected short-range adapter. Move HA's bluetooth adapter (or "
+                "a bluetooth_proxy) closer to the lock and try again."
+            )
+
+        async with SCKTransport(ble_device) as transport:
+            client = SCKClient(transport)
+            result = await client.register(pin, name=name)
+
+        return {
+            "lock_id": result.lock_id,
+            "adv_data_key": result.adv_data_key.hex(),
+            "smartphone_id": result.smartphone_id.hex(),
+        }
+
+
+class SCKOptionsFlow(OptionsFlow):
+    """Lets the user repick scanner sources after install."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        self.config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        address = self.config_entry.data[CONF_ADDRESS]
+        long_choices = _scanner_choices(self.hass, address, connectable=False)
+        short_choices = _scanner_choices(self.hass, address, connectable=True)
+
+        current_long = self.config_entry.options.get(
+            CONF_LONG_RANGE_SOURCE, SOURCE_AUTO
+        )
+        current_short = self.config_entry.options.get(
+            CONF_SHORT_RANGE_SOURCE, SOURCE_AUTO
+        )
+        # Preserve currently-set sources in the choices even if that scanner
+        # isn't actively seeing the lock right now (e.g. a proxy that's
+        # offline) — otherwise the form would silently drop the selection.
+        long_choices.setdefault(current_long, f"{current_long} (not currently seen)")
+        short_choices.setdefault(current_short, f"{current_short} (not currently seen)")
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_LONG_RANGE_SOURCE, default=current_long
+                    ): vol.In(long_choices),
+                    vol.Required(
+                        CONF_SHORT_RANGE_SOURCE, default=current_short
+                    ): vol.In(short_choices),
+                }
+            ),
+        )

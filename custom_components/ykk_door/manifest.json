@@ -1,0 +1,17 @@
+{
+  "domain": "ykk_door",
+  "name": "YKK Smart Control Key",
+  "version": "0.1.0",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/example/ykk_door",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/example/ykk_door/issues",
+  "requirements": [],
+  "bluetooth": [
+    {
+      "service_uuid": "a437df7b-60cc-4b5c-98d1-c05e85c88c77"
+    }
+  ]
+}
