@@ -90,7 +90,7 @@ def _scanner_choices(
     for sd in bluetooth.async_scanner_devices_by_address(
         hass, address, connectable=connectable
     ):
-        rssi = sd.advertisement_data.rssi
+        rssi = sd.advertisement.rssi
         choices[sd.scanner.source] = (
             f"{sd.scanner.name} [{sd.scanner.source}]  {rssi} dBm"
         )
