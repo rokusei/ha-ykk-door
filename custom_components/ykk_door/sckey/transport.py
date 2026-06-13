@@ -29,6 +29,7 @@ from typing import AsyncIterator, Callable
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 
 from .frames import CHARACTERISTIC_UUID, SERVICE_UUID, parse_frame
 
@@ -108,6 +109,18 @@ class SCKTransport:
             )
             await self._client.connect()
             _LOGGER.debug("Connected via plain BleakClient")
+        # The lock requires an authenticated/bonded link to enable
+        # notifications on the SCK characteristic (writing the CCCD raises
+        # `error=5 Insufficient authentication` otherwise). Pair before
+        # start_notify so the bond is established by then. pair() is a
+        # no-op if a bond already exists; some backends raise
+        # NotImplementedError or pair lazily on the next encrypted op —
+        # swallow that and let start_notify surface any remaining issue.
+        try:
+            await self._client.pair()
+            _LOGGER.debug("Pair complete")
+        except (NotImplementedError, BleakError) as e:
+            _LOGGER.debug("pair() not effective here, continuing: %s", e)
         await self._client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
         return self
 
