@@ -166,7 +166,7 @@ class SCKCoordinator:
                     "connection on the selected short-range adapter."
                 )
             target_state = LockState.LOCKED if locked else LockState.UNLOCKED
-            async with SCKTransport(ble_device) as transport:
+            async with SCKTransport(ble_device, pairing_pin=self._pin) as transport:
                 client = SCKClient(transport)
                 ok = await client.verify_pin(self._pin)
                 if not ok:

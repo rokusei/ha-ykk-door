@@ -23,6 +23,7 @@ discovery is scoped to one service.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
@@ -45,6 +46,125 @@ try:
 except ImportError:  # pragma: no cover - HA always has it; standalone may not
     _HAS_RETRY_CONNECTOR = False
 
+try:
+    from dbus_fast.aio import MessageBus
+    from dbus_fast.constants import BusType
+    from dbus_fast.service import ServiceInterface, method
+
+    _HAS_DBUS_FAST = True
+except ImportError:  # pragma: no cover - present on HA/Linux, absent elsewhere
+    _HAS_DBUS_FAST = False
+
+
+_AGENT_PATH = "/com/ykkdoor/agent"
+
+
+if _HAS_DBUS_FAST:
+
+    class _PinAgent(ServiceInterface):  # type: ignore[misc]
+        """BlueZ pairing agent that answers PIN/passkey requests with a fixed value.
+
+        The SCK lock requires a passkey-authenticated bond before it'll let the
+        SCK characteristic's CCCD be written. Bleak's ``pair()`` itself takes
+        no passkey argument on BlueZ — BlueZ asks the registered ``Agent1`` for
+        one. We register this agent for the duration of pair() and tear it
+        down after, so it doesn't shadow any other system agent.
+        """
+
+        def __init__(self, pin: str) -> None:
+            super().__init__("org.bluez.Agent1")
+            self._pin = pin
+
+        @method()
+        def Release(self):  # noqa: N802
+            return
+
+        @method()
+        def RequestPinCode(self, device: "o") -> "s":  # noqa: F821, N802
+            _LOGGER.debug("BlueZ RequestPinCode(%s)", device)
+            return self._pin
+
+        @method()
+        def DisplayPinCode(self, device: "o", pincode: "s"):  # noqa: F821, N802
+            return
+
+        @method()
+        def RequestPasskey(self, device: "o") -> "u":  # noqa: F821, N802
+            _LOGGER.debug("BlueZ RequestPasskey(%s)", device)
+            return int(self._pin)
+
+        @method()
+        def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):  # noqa: F821, N802
+            return
+
+        @method()
+        def RequestConfirmation(self, device: "o", passkey: "u"):  # noqa: F821, N802
+            return
+
+        @method()
+        def RequestAuthorization(self, device: "o"):  # noqa: F821, N802
+            return
+
+        @method()
+        def AuthorizeService(self, device: "o", uuid: "s"):  # noqa: F821, N802
+            return
+
+        @method()
+        def Cancel(self):  # noqa: N802
+            return
+
+
+@asynccontextmanager
+async def _bluez_pin_agent(pin: str | None) -> AsyncIterator[None]:
+    """Register a one-shot BlueZ Agent1 that supplies `pin` for pairing.
+
+    No-op when `pin` is None, when dbus_fast is unavailable, or when the
+    system DBus / org.bluez aren't reachable (e.g. non-Linux backends or
+    headless test envs).
+    """
+    if pin is None or not _HAS_DBUS_FAST:
+        yield
+        return
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as e:  # pragma: no cover - depends on host
+        _LOGGER.debug("System DBus unavailable, skipping pairing agent: %s", e)
+        yield
+        return
+    try:
+        agent = _PinAgent(pin)
+        bus.export(_AGENT_PATH, agent)
+        try:
+            introspect = await bus.introspect("org.bluez", "/org/bluez")
+            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspect)
+            mgr = proxy.get_interface("org.bluez.AgentManager1")
+        except Exception as e:
+            _LOGGER.debug("org.bluez AgentManager1 unavailable: %s", e)
+            yield
+            return
+        try:
+            await mgr.call_register_agent(_AGENT_PATH, "KeyboardOnly")
+        except Exception as e:
+            _LOGGER.debug("RegisterAgent failed: %s", e)
+            yield
+            return
+        # RequestDefaultAgent so BlueZ routes passkey prompts to us even when
+        # another agent (e.g. HA's bluetooth integration) is also registered.
+        # Best-effort: pairing may still succeed via our agent even if this
+        # call is refused.
+        with contextlib.suppress(Exception):
+            await mgr.call_request_default_agent(_AGENT_PATH)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                await mgr.call_unregister_agent(_AGENT_PATH)
+    finally:
+        with contextlib.suppress(Exception):
+            bus.unexport(_AGENT_PATH)
+        with contextlib.suppress(Exception):
+            bus.disconnect()
+
 
 class SCKTransport:
     """Single-characteristic request/response over GATT notify.
@@ -66,6 +186,11 @@ class SCKTransport:
         Optional callback to re-resolve the device on reconnect (used by
         bleak_retry_connector for proxy environments where the RPA may
         rotate between attempts).
+    pairing_pin : str or None
+        6-digit ASCII PIN to feed BlueZ's pairing agent on RequestPasskey /
+        RequestPinCode. Required for first-time bonding (factory default
+        111111). After the bond exists pair() short-circuits and the PIN is
+        never asked for — passing it on every connect is harmless.
     """
 
     def __init__(
@@ -76,12 +201,14 @@ class SCKTransport:
         connect_timeout: float = 30.0,
         max_connect_attempts: int = 3,
         device_lookup: Callable[[], BLEDevice | None] | None = None,
+        pairing_pin: str | None = None,
     ):
         self._target = device
         self._response_timeout = response_timeout
         self._connect_timeout = connect_timeout
         self._max_attempts = max_connect_attempts
         self._device_lookup = device_lookup
+        self._pairing_pin = pairing_pin
         self._client: BleakClient | None = None
         self._notify_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -116,11 +243,16 @@ class SCKTransport:
         # no-op if a bond already exists; some backends raise
         # NotImplementedError or pair lazily on the next encrypted op —
         # swallow that and let start_notify surface any remaining issue.
-        try:
-            await self._client.pair()
-            _LOGGER.debug("Pair complete")
-        except (NotImplementedError, BleakError) as e:
-            _LOGGER.debug("pair() not effective here, continuing: %s", e)
+        # SCK locks demand a passkey (factory default 111111). On BlueZ,
+        # bleak's pair() takes no PIN arg — BlueZ asks the registered
+        # Agent1 for one. _bluez_pin_agent registers a temporary agent
+        # that supplies our PIN for the duration of pair().
+        async with _bluez_pin_agent(self._pairing_pin):
+            try:
+                await self._client.pair()
+                _LOGGER.debug("Pair complete")
+            except (NotImplementedError, BleakError) as e:
+                _LOGGER.debug("pair() not effective here, continuing: %s", e)
         await self._client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
         return self
 
