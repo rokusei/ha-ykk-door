@@ -290,6 +290,8 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                 )
 
+        info = self._discovered.get(self._address)
+        gap_name = (info.name if info else None) or DEFAULT_NAME
         return self.async_show_form(
             step_id="manual",
             data_schema=vol.Schema(
@@ -297,7 +299,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_ADV_DATA_KEY): str,
                     vol.Required(CONF_LOCK_ID): str,
                     vol.Required(CONF_PIN, default="111111"): str,
-                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
+                    vol.Optional(CONF_NAME, default=gap_name): str,
                 }
             ),
             errors=errors,
@@ -347,17 +349,18 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         info = self._discovered.get(self._address)
+        gap_name = (info.name if info else None) or DEFAULT_NAME
         return self.async_show_form(
             step_id="register",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_PIN, default="111111"): str,
-                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
+                    vol.Optional(CONF_NAME, default=gap_name): str,
                 }
             ),
             description_placeholders={
                 "address": self._address,
-                "name": (info.name if info else None) or "SCK lock",
+                "name": gap_name,
             },
             errors=errors,
         )
@@ -391,7 +394,10 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
-        async with SCKTransport(ble_device) as transport:
+        # Registration is single-shot and the lock can be slow to ACK the
+        # first frame right after pairing; give it more headroom than the
+        # 5s default we use for lock/unlock.
+        async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
             result = await client.register(pin, name=name)
 
