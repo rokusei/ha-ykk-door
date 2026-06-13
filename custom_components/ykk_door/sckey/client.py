@@ -121,15 +121,13 @@ class SCKClient:
         self._check_ack(body, 0x03, 0x44)
 
     async def register(self, pin: str, name: str = "SCK") -> RegistrationResult:
-        """Full admin-smartphone registration handshake. Requires the lock
-        to be in registration mode (press the physical button)."""
-        # 0. Claim the admin-smartphone slot — the lock ignores everything
-        # else until this is accepted.
-        rc = await self.enter_registration_mode_admin()
-        if rc != 1:
-            raise RuntimeError(
-                f"lock refused admin-smartphone registration (response code {rc})"
-            )
+        """Admin-smartphone enrollment after the lock has accepted our claim.
+
+        Caller must have already run ``enter_registration_mode_admin`` on a
+        previous transport session — the lock disconnects immediately after
+        responding to that frame, so this method assumes a fresh connection
+        established on the bond produced during the enter step.
+        """
         # 1. Get adv-data key
         body = await self._send(build_frame(Cmd.REQUEST_ADV_DATA_KEY.to_bytes(2, "big")))
         # Response: 00 10 <16 key bytes>

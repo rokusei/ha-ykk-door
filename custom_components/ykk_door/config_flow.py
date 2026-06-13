@@ -24,6 +24,7 @@ unusual install paths.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import sys
@@ -396,24 +397,17 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         """Open a GATT connection (over the chosen short-range scanner) and
         run the registration handshake.
 
+        Two-stage: the lock disconnects immediately after responding to
+        EnterRegistrationModeAdminSmartphone (0x8343), so we open a first
+        transport just for that frame, let the lock drop the link, then
+        reconnect (the bond persists) and run the rest of the flow.
+
         Returns plain-str fields suitable for storing in the config entry.
         """
         if not pin.isdigit() or len(pin) != 6:
             raise RuntimeError("PIN must be exactly 6 digits")
 
-        ble_device = None
-        if self._short_source == SOURCE_AUTO:
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self._address, connectable=True
-            )
-        else:
-            for sd in bluetooth.async_scanner_devices_by_address(
-                self.hass, self._address, connectable=True
-            ):
-                if sd.scanner.source == self._short_source:
-                    ble_device = sd.ble_device
-                    break
-
+        ble_device = self._pick_ble_device()
         if ble_device is None:
             raise RuntimeError(
                 "Lock is not currently reachable for a GATT connection on the "
@@ -421,9 +415,24 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
-        # Registration is single-shot and the lock can be slow to ACK the
-        # first frame right after pairing; give it more headroom than the
-        # 5s default we use for lock/unlock.
+        # Stage 1: claim the admin-smartphone slot. The lock will hang up
+        # after ACKing this; that's expected.
+        async with SCKTransport(ble_device, response_timeout=10.0) as transport:
+            client = SCKClient(transport)
+            rc = await client.enter_registration_mode_admin()
+        if rc != 1:
+            raise RuntimeError(
+                f"lock refused admin-smartphone registration (response code {rc})"
+            )
+
+        # Give the lock a moment to settle and re-advertise after it tore
+        # down the previous link. Re-resolve the BLE device since the RPA
+        # may have rotated.
+        await asyncio.sleep(1.0)
+        ble_device = self._pick_ble_device() or ble_device
+
+        # Stage 2: run the data-exchange portion of the enrollment over a
+        # fresh connection (bond from stage 1 persists).
         async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
             result = await client.register(pin, name=name)
@@ -433,6 +442,20 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
             "adv_data_key": result.adv_data_key.hex(),
             "smartphone_id": result.smartphone_id.hex(),
         }
+
+    def _pick_ble_device(self):
+        """Return a BLEDevice for ``self._address`` on the selected short-
+        range scanner, or None if not currently reachable."""
+        if self._short_source == SOURCE_AUTO:
+            return bluetooth.async_ble_device_from_address(
+                self.hass, self._address, connectable=True
+            )
+        for sd in bluetooth.async_scanner_devices_by_address(
+            self.hass, self._address, connectable=True
+        ):
+            if sd.scanner.source == self._short_source:
+                return sd.ble_device
+        return None
 
 
 class SCKOptionsFlow(OptionsFlow):
