@@ -25,6 +25,7 @@ unusual install paths.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import Any
 
@@ -67,6 +68,32 @@ _LOGGER = logging.getLogger(__name__)
 def _is_android() -> bool:
     """sckey -> bleak has no Android backend. Refuse setup if we're on it."""
     return hasattr(sys, "getandroidapilevel")
+
+
+_MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}$")
+
+
+def _gap_name(info: BluetoothServiceInfoBleak | None) -> str | None:
+    """Return the lock's advertised GAP name, or None if only an address is known.
+
+    HA's BluetoothServiceInfoBleak.name falls back to the address when no
+    local name has been received in adverts (e.g. when the only scanner
+    hearing the lock is a passive proxy that never captures the scan
+    response). Treat that as "no name" so callers can fall back to
+    DEFAULT_NAME instead of writing the MAC to the lock during
+    REGISTER_NAME.
+    """
+    if info is None:
+        return None
+    # Prefer the explicit advertised local name if present.
+    adv = getattr(info, "advertisement", None)
+    local = getattr(adv, "local_name", None) if adv is not None else None
+    if local and not _MAC_PATTERN.match(local):
+        return local
+    name = info.name
+    if name and not _MAC_PATTERN.match(name):
+        return name
+    return None
 
 
 def _is_sck(service_info: BluetoothServiceInfoBleak) -> bool:
@@ -146,7 +173,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovered[discovery_info.address] = discovery_info
         self._address = discovery_info.address
         self.context["title_placeholders"] = {
-            "name": discovery_info.name or "SCK lock"
+            "name": _gap_name(discovery_info) or "SCK lock"
         }
         return await self.async_step_adapters()
 
@@ -291,7 +318,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         info = self._discovered.get(self._address)
-        gap_name = (info.name if info else None) or DEFAULT_NAME
+        gap_name = _gap_name(info) or DEFAULT_NAME
         return self.async_show_form(
             step_id="manual",
             data_schema=vol.Schema(
@@ -349,7 +376,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         info = self._discovered.get(self._address)
-        gap_name = (info.name if info else None) or DEFAULT_NAME
+        gap_name = _gap_name(info) or DEFAULT_NAME
         return self.async_show_form(
             step_id="register",
             data_schema=vol.Schema(
