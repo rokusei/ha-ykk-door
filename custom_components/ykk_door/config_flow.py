@@ -391,7 +391,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
-        async with SCKTransport(ble_device, pairing_pin=pin) as transport:
+        async with SCKTransport(ble_device) as transport:
             client = SCKClient(transport)
             result = await client.register(pin, name=name)
 
