@@ -13,7 +13,12 @@ from .frames import build_frame
 
 class Cmd(IntEnum):
     """Observed (opcode << 8) | sub-opcode values. Names match the React
-    Native app's command class names where known."""
+    Native app's command class names where known.
+
+    The first byte encodes ``direction | category``: phoneToDevice = 0x80,
+    deviceToPhone = 0x00; categories main=0, information=1, history=2,
+    settings=3. The second byte is the per-category sub-opcode.
+    """
     REQUEST_ADV_DATA_KEY = 0x8010
     REQUEST_LOCK_ID = 0x8342
     REQUEST_SMARTPHONE_ID = 0x8341
@@ -23,6 +28,11 @@ class Cmd(IntEnum):
     VERIFY_PIN = 0x8313
     SET_LOCK_STATE = 0x8003       # 3rd byte: 0x01 lock, 0x02 unlock
     SET_TIMESTAMP = 0x8102
+    # settings.registrationMode.{enter,exit}.adminSmartphone — must be the
+    # first frame sent once the lock is in its physical registration window;
+    # the lock silently ignores every other command until it accepts this.
+    ENTER_REG_MODE_ADMIN_SMARTPHONE = 0x8343
+    EXIT_REG_MODE_ADMIN_SMARTPHONE = 0x8344
     FW_UPDATE_REQUEST_LOCK = 0x8131
     FW_TRANSMISSION_COUNT_LOCK = 0x8132
     FW_SEND_DATA_LOCK = 0x8133
@@ -84,3 +94,11 @@ def set_timestamp(when: _dt.datetime | None = None) -> bytes:
     when = when or _dt.datetime.now()
     payload = when.strftime("%Y%m%d%H%M").encode("ascii")
     return build_frame(_two(Cmd.SET_TIMESTAMP) + payload)
+
+
+def enter_registration_mode_admin() -> bytes:
+    return build_frame(_two(Cmd.ENTER_REG_MODE_ADMIN_SMARTPHONE))
+
+
+def exit_registration_mode_admin() -> bytes:
+    return build_frame(_two(Cmd.EXIT_REG_MODE_ADMIN_SMARTPHONE))

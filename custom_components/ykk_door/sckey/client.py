@@ -8,6 +8,8 @@ import datetime as _dt
 
 from .commands import (
     Cmd,
+    enter_registration_mode_admin as _build_enter_reg_mode,
+    exit_registration_mode_admin as _build_exit_reg_mode,
     request_lock_id as _build_request_lock_id,
     request_smartphone_id as _build_request_smartphone_id,
     register_pin as _build_register_pin,
@@ -102,10 +104,32 @@ class SCKClient:
         return await self.set_state(LockState.UNLOCKED, lock_id)
 
     # --- composite flows -------------------------------------------------
+    async def enter_registration_mode_admin(self) -> int:
+        """Tell the lock we want to claim its admin-smartphone slot.
+
+        Must be the first frame after pairing while the lock is in its
+        physical registration window — until the lock accepts this, every
+        other command is silently dropped. Returns the lock's response code
+        (1 = OK, 2 = NG, 3 = limit reached).
+        """
+        body = await self._send(_build_enter_reg_mode())
+        payload = self._check_ack(body, 0x03, 0x43)
+        return payload[0] if payload else 0
+
+    async def exit_registration_mode_admin(self) -> None:
+        body = await self._send(_build_exit_reg_mode())
+        self._check_ack(body, 0x03, 0x44)
+
     async def register(self, pin: str, name: str = "SCK") -> RegistrationResult:
         """Full admin-smartphone registration handshake. Requires the lock
         to be in registration mode (press the physical button)."""
-        await self.set_timestamp()
+        # 0. Claim the admin-smartphone slot — the lock ignores everything
+        # else until this is accepted.
+        rc = await self.enter_registration_mode_admin()
+        if rc != 1:
+            raise RuntimeError(
+                f"lock refused admin-smartphone registration (response code {rc})"
+            )
         # 1. Get adv-data key
         body = await self._send(build_frame(Cmd.REQUEST_ADV_DATA_KEY.to_bytes(2, "big")))
         # Response: 00 10 <16 key bytes>
