@@ -1,6 +1,7 @@
 from .frames import (
     SERVICE_UUID,
-    CHARACTERISTIC_UUID,
+    NOTIFY_UUID,
+    WRITE_UUID,
     build_frame,
     parse_frame,
     crc16,
@@ -28,7 +29,8 @@ from .advertising import (
 
 __all__ = [
     "SERVICE_UUID",
-    "CHARACTERISTIC_UUID",
+    "NOTIFY_UUID",
+    "WRITE_UUID",
     "build_frame",
     "parse_frame",
     "crc16",

@@ -31,7 +31,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-from .frames import CHARACTERISTIC_UUID, SERVICE_UUID, parse_frame
+from .frames import NOTIFY_UUID, SERVICE_UUID, WRITE_UUID, parse_frame
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,13 +123,13 @@ class SCKTransport:
             _LOGGER.debug("Pair complete")
         except (NotImplementedError, BleakError) as e:
             _LOGGER.debug("pair() not effective here, continuing: %s", e)
-        await self._client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
+        await self._client.start_notify(NOTIFY_UUID, self._on_notify)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._client is not None and self._client.is_connected:
             try:
-                await self._client.stop_notify(CHARACTERISTIC_UUID)
+                await self._client.stop_notify(NOTIFY_UUID)
             except Exception:
                 pass
             try:
@@ -155,7 +155,7 @@ class SCKTransport:
         # Drain any stale notifications before sending a new request
         while not self._notify_queue.empty():
             self._notify_queue.get_nowait()
-        await self._client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=True)
+        await self._client.write_gatt_char(WRITE_UUID, frame, response=True)
         try:
             data = await asyncio.wait_for(
                 self._notify_queue.get(), timeout=self._response_timeout

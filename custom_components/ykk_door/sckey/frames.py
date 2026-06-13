@@ -5,7 +5,11 @@ poly=0x1021, init=0xFFFF, no reflection, xorout=0xFFFF.
 """
 
 SERVICE_UUID = "a437df7b-60cc-4b5c-98d1-c05e85c88c77"
-CHARACTERISTIC_UUID = "a4370001-60cc-4b5c-98d1-c05e85c88c77"
+# The lock exposes two characteristics on the SCK service: notifications come
+# in on NOTIFY_UUID; commands must be written to WRITE_UUID. Writing to the
+# notify characteristic silently no-ops on the lock.
+NOTIFY_UUID = "a4370001-60cc-4b5c-98d1-c05e85c88c77"
+WRITE_UUID = "a4370002-60cc-4b5c-98d1-c05e85c88c77"
 
 
 def crc16(data: bytes) -> int:
