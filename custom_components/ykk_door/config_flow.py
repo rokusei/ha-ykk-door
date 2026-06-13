@@ -24,7 +24,6 @@ unusual install paths.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import sys
@@ -395,12 +394,14 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _run_registration(self, pin: str, name: str) -> dict[str, str]:
         """Open a GATT connection (over the chosen short-range scanner) and
-        run the registration handshake.
+        run the full registration handshake on it.
 
-        Two-stage: the lock disconnects immediately after responding to
-        EnterRegistrationModeAdminSmartphone (0x8343), so we open a first
-        transport just for that frame, let the lock drop the link, then
-        reconnect (the bond persists) and run the rest of the flow.
+        Everything has to land on the same connection: the lock briefly
+        accepts data-exchange commands right after acking
+        EnterRegistrationModeAdminSmartphone (the beep) and tears the link
+        down soon after. Reconnects after that are treated as normal
+        sessions and the registration opcodes are silently ignored, so a
+        slow proxy / extra round-trip can blow the budget.
 
         Returns plain-str fields suitable for storing in the config entry.
         """
@@ -415,24 +416,6 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
-        # Stage 1: claim the admin-smartphone slot. The lock will hang up
-        # after ACKing this; that's expected.
-        async with SCKTransport(ble_device, response_timeout=10.0) as transport:
-            client = SCKClient(transport)
-            rc = await client.enter_registration_mode_admin()
-        if rc != 1:
-            raise RuntimeError(
-                f"lock refused admin-smartphone registration (response code {rc})"
-            )
-
-        # Give the lock a moment to settle and re-advertise after it tore
-        # down the previous link. Re-resolve the BLE device since the RPA
-        # may have rotated.
-        await asyncio.sleep(1.0)
-        ble_device = self._pick_ble_device() or ble_device
-
-        # Stage 2: run the data-exchange portion of the enrollment over a
-        # fresh connection (bond from stage 1 persists).
         async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
             result = await client.register(pin, name=name)

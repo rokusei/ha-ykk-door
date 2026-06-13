@@ -121,13 +121,25 @@ class SCKClient:
         self._check_ack(body, 0x03, 0x44)
 
     async def register(self, pin: str, name: str = "SCK") -> RegistrationResult:
-        """Admin-smartphone enrollment after the lock has accepted our claim.
+        """Full admin-smartphone enrollment in one connection.
 
-        Caller must have already run ``enter_registration_mode_admin`` on a
-        previous transport session — the lock disconnects immediately after
-        responding to that frame, so this method assumes a fresh connection
-        established on the bond produced during the enter step.
+        The lock briefly accepts data-exchange commands after it ACKs
+        EnterRegistrationModeAdminSmartphone (0x8343) and tears the link
+        down shortly after. We have to push the entire sequence through on
+        this single connection before that happens — once the lock has
+        beeped and exited registration mode, subsequent reconnects are
+        treated as normal authenticated sessions and the registration
+        opcodes are silently ignored.
+
+        Requires the lock to be in registration mode (press the physical
+        button) at the time of the call.
         """
+        # 0. Claim the admin-smartphone slot. The lock beeps on success.
+        rc = await self.enter_registration_mode_admin()
+        if rc != 1:
+            raise RuntimeError(
+                f"lock refused admin-smartphone registration (response code {rc})"
+            )
         # 1. Get adv-data key
         body = await self._send(build_frame(Cmd.REQUEST_ADV_DATA_KEY.to_bytes(2, "big")))
         # Response: 00 10 <16 key bytes>
