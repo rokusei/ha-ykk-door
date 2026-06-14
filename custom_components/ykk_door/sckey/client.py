@@ -150,38 +150,32 @@ class SCKClient:
         self._check_ack(body, 0x03, 0x44)
 
     async def register(
-        self, pin: str, name: str = "SCK", app_version: str = "2.1.1"
+        self, pin: str, name: str = "SCK"
     ) -> RegistrationResult:
-        """Full admin-smartphone (managementPhone) enrollment, pipelined.
+        """Admin-smartphone (managementPhone) enrollment, pipelined.
 
-        Builds 8 frames upfront (enter + Step1×5 + Step2×1 + Step3×1) and
-        ships them through the transport pipeline so the entire sequence
-        fits in the lock's ~220ms post-pair window. Responses are validated
-        only after the full pipeline completes; if `enter` is rejected
-        (rc != 1) the lock rejects subsequent frames anyway, so no lock
-        state actually changes.
+        Trimmed from the full RN app saga to fit the lock's hard ~200ms
+        post-pair window: drops SetAppVersion (productCode=2 only — our
+        lock's productCode is unconfirmed, and 0.1.16 traces showed the
+        lock never returned a notify for opcode 0103) and SetTimestamp
+        (same — no 0102 notify ever observed). The lock also delivers
+        notifications out-of-order relative to the write sequence
+        (observed 0010 arriving before 0343), so we match responses by
+        opcode prefix rather than pipeline index.
 
-        The RN app's Step2 also reads the existing lock name via RequestName
-        purely to surface it in its UI. We drop that here — saves one BLE
-        conn event in the critical-path window.
-
-        Wire sequence after pair+notify, all on the same link:
-          enter (0x8343)  → ack 03 43 01 (lock beeps)
-          SetAppVersion   → ack 01 03, validAppVersion must be non-zero
-          SetTimestamp    → ack 01 02
-          RequestAdvDataKey → 00 10 <16-byte key>
-          RequestLockId   → 03 42 ...
-          RequestSmartphoneId → 03 41 ...
-          RegisterPin     → 03 12 ...
-          RegisterName    → 03 22 ... (Step3 — write the new name)
+        Wire sequence after pair+notify (6 frames, all on the same link):
+          enter (0x8343)         → 03 43 01 (lock beeps)
+          RequestAdvDataKey      → 00 10 <16-byte key>
+          RequestLockId          → 03 42 ...
+          RequestSmartphoneId    → 03 41 ...
+          RegisterPin            → 03 12 ...
+          RegisterName           → 03 22 ...
 
         Requires the lock to be in registration mode (press the physical
         button) at the time of the call.
         """
         frames = [
             _build_enter_reg_mode(),
-            _build_set_app_version(app_version),
-            _build_set_timestamp(),
             _build_request_adv_data_key(),
             _build_request_lock_id(),
             _build_request_smartphone_id(0),
@@ -189,30 +183,35 @@ class SCKClient:
             _build_register_name(name),
         ]
         responses = await self._t.write_pipeline(frames)
+        # Match responses by opcode prefix — the lock delivers notifies
+        # out-of-order relative to write order. Each command has a unique
+        # 2-byte response prefix.
+        by_prefix = {bytes(r[:2]): r for r in responses}
 
-        # Validate in pipeline order. _check_ack raises ValueError on bad
-        # prefix; the chain below catches per-stage failures so the error
-        # message tells you which command the lock rejected.
-        enter_payload = self._check_ack(responses[0], 0x03, 0x43)
+        def _need(prefix: bytes) -> bytes:
+            body = by_prefix.get(prefix)
+            if body is None:
+                got = ", ".join(p.hex() for p in by_prefix)
+                raise RuntimeError(
+                    f"missing response for opcode {prefix.hex()} "
+                    f"(received: {got or 'none'})"
+                )
+            return body
+
+        enter_payload = self._check_ack(_need(b"\x03\x43"), 0x03, 0x43)
         rc = enter_payload[0] if enter_payload else 0
         if rc != 1:
             raise RuntimeError(
                 f"lock refused admin-smartphone registration (response code {rc})"
             )
-        av_payload = self._check_ack(responses[1], 0x01, 0x03)
-        if not av_payload or av_payload[0] == 0:
-            raise RuntimeError(
-                f"lock rejected app version {app_version!r} (validAppVersion=0)"
-            )
-        self._check_ack(responses[2], 0x01, 0x02)  # SetTimestamp
-        adv_data_key = self._check_ack(responses[3], 0x00, 0x10)[:16]
-        lid_payload = self._check_ack(responses[4], 0x03, 0x42)
+        adv_data_key = self._check_ack(_need(b"\x00\x10"), 0x00, 0x10)[:16]
+        lid_payload = self._check_ack(_need(b"\x03\x42"), 0x03, 0x42)
         if lid_payload and lid_payload[0] == 0x82:
             lid_payload = lid_payload[1:]
         lock_id = lid_payload.split(b"\x00", 1)[0].decode("ascii")
-        smartphone_id = self._check_ack(responses[5], 0x03, 0x41)
-        self._check_ack(responses[6], 0x03, 0x12)  # RegisterPin
-        self._check_ack(responses[7], 0x03, 0x22)  # RegisterName
+        smartphone_id = self._check_ack(_need(b"\x03\x41"), 0x03, 0x41)
+        self._check_ack(_need(b"\x03\x12"), 0x03, 0x12)  # RegisterPin
+        self._check_ack(_need(b"\x03\x22"), 0x03, 0x22)  # RegisterName
         return RegistrationResult(
             lock_id=lock_id,
             adv_data_key=adv_data_key,
