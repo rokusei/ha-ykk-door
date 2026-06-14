@@ -167,23 +167,36 @@ class SCKTransport:
         return parse_frame(data)
 
     async def write_pipeline(
-        self, frames: list[bytes], *, timeout: float | None = None
+        self,
+        frames: list[bytes],
+        *,
+        timeout: float | None = None,
+        write_response: bool = False,
     ) -> list[bytes]:
-        """Send `frames` back-to-back without waiting for notify responses
-        between writes, then collect one notification per write in order.
+        """Dispatch `frames` concurrently, then collect one notification per
+        write in order.
 
-        Used for the lock's post-pair registration window, which is too
-        small (~230ms over a BT proxy) for the per-frame write→wait-notify
-        pattern. The SCK write characteristic is write-with-response only,
-        so we can't fully fire-and-forget — each write still awaits its
-        BLE-level write response — but the application-level notify wait
-        per write (1-2 conn intervals) is skipped, which collapses several
-        hundred ms of total wall-clock.
+        Used for the lock's post-pair registration window (~220ms over a BT
+        proxy) which is too tight for any sequential write pattern. Two
+        compounding optimisations vs 0.1.14:
 
-        Responses are matched to frames by index: the lock processes
-        commands sequentially per the RN app's saga code (`writeAndWait`
-        chains in `registerLockStep1`), so notify order matches write
-        order.
+        * **asyncio.gather** dispatches all writes in parallel at the API
+          layer (the proxy still serialises at BLE, but the per-write WiFi
+          round-trip stops being on the critical path).
+        * **write_response=False** issues ATT write-without-response, so
+          each write returns immediately at the API layer (no BLE-level
+          ATT ACK wait). Multiple short writes fit in 1-2 BLE conn events
+          as LL data PDUs.
+
+        Risk: if the SCK write characteristic only declares
+        write-with-response, write-without-response is silently dropped on
+        the lock side — the writes "succeed" at the API layer but the
+        lock never sees them. Symptom: zero notifications + no beep. Pass
+        `write_response=True` to fall back to the safer mode.
+
+        Responses are matched to frames by index — the lock processes
+        commands sequentially per the RN app's saga code, so notify
+        arrival order tracks write order.
         """
         if self._client is None:
             raise RuntimeError("transport not entered")
@@ -195,19 +208,28 @@ class SCKTransport:
 
         loop = asyncio.get_event_loop()
         t_start = loop.time()
-        for i, frame in enumerate(frames):
-            try:
-                await self._client.write_gatt_char(WRITE_UUID, frame, response=True)
-            except BleakError as e:
+        write_results = await asyncio.gather(
+            *(
+                self._client.write_gatt_char(
+                    WRITE_UUID, frame, response=write_response
+                )
+                for frame in frames
+            ),
+            return_exceptions=True,
+        )
+        for i, r in enumerate(write_results):
+            if isinstance(r, BaseException):
                 raise BleakError(
-                    f"pipeline write {i + 1}/{len(frames)} ({frame[:2].hex()}) "
-                    f"failed after {(loop.time() - t_start) * 1000:.0f}ms: {e}"
-                ) from e
+                    f"pipeline write {i + 1}/{len(frames)} "
+                    f"({frames[i][:2].hex()}) failed after "
+                    f"{(loop.time() - t_start) * 1000:.0f}ms: {r}"
+                ) from r
         t_writes_done = loop.time()
         _LOGGER.debug(
-            "Pipeline dispatched %d writes in %.0fms",
+            "Pipeline dispatched %d writes in %.0fms (write_response=%s)",
             len(frames),
             (t_writes_done - t_start) * 1000,
+            write_response,
         )
 
         results: list[bytes] = []
