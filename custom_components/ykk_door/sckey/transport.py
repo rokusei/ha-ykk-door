@@ -123,8 +123,27 @@ class SCKTransport:
         try:
             await self._client.pair()
             _LOGGER.debug("Pair complete")
-        except (NotImplementedError, BleakError) as e:
-            _LOGGER.debug("pair() not effective here, continuing: %s", e)
+        except NotImplementedError as e:
+            # Some bleak backends don't implement explicit pair() and
+            # instead lazy-pair on the next encrypted GATT op. That's
+            # fine — start_notify will surface any remaining issue.
+            _LOGGER.debug(
+                "pair() not implemented in this backend, continuing: %s", e
+            )
+        except BleakError as e:
+            # SMP actually failed (e.g. "Pairing failed due to error: 97"
+            # on the bleak-esphome backend). Without an encrypted link
+            # the SCK characteristic write is silently dropped on the
+            # lock side — we'd burn an admin slot for nothing. Abort
+            # here so the caller can surface an actionable error.
+            await self._client.disconnect()
+            raise RuntimeError(
+                f"BLE pairing failed: {e}. Likely cause: stale bond on "
+                f"the proxy NVS or in the lock's bond list. Power-cycle "
+                f"the bt proxy AND clear the lock's smartphone "
+                f"associations (or factory-reset the lock if associations "
+                f"don't clear the BLE bond), then retry."
+            ) from e
         if not self._skip_notify:
             await self._client.start_notify(NOTIFY_UUID, self._on_notify)
         else:
