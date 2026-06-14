@@ -37,6 +37,7 @@ from .const import (
     CONF_LONG_RANGE_SOURCE,
     CONF_PIN,
     CONF_SHORT_RANGE_SOURCE,
+    CONF_SMARTPHONE_ID,
     DOMAIN,
     SOURCE_AUTO,
 )
@@ -56,9 +57,14 @@ class SCKCoordinator:
         self.hass = hass
         self.entry = entry
         self.address: str = entry.data[CONF_ADDRESS]
+        # Either field may be empty when registration was partial — the
+        # lock doesn't always return notifies for every request inside
+        # its post-pair window. They get backfilled lazily on the first
+        # authenticated GATT session.
         self.lock_id: str = entry.data[CONF_LOCK_ID]
         self._pin: str = entry.data[CONF_PIN]
-        self._adv_key: bytes = bytes.fromhex(entry.data[CONF_ADV_DATA_KEY])
+        adv_hex: str = entry.data[CONF_ADV_DATA_KEY]
+        self._adv_key: bytes = bytes.fromhex(adv_hex) if adv_hex else b""
 
         self.latest: DecodedAdv | None = None
         self.last_rssi: int | None = None
@@ -141,7 +147,10 @@ class SCKCoordinator:
         # If multiple SCK locks are configured (or a neighbour's lock happens
         # to share an unrelated AdvDataKey collision), only accept adverts
         # whose decoded lock_id matches the one stored at registration.
-        if decoded.lock_id != self.lock_id:
+        # When lock_id hasn't been backfilled yet, accept any advert that
+        # decoded cleanly — the key alone is per-lock so a clean decode is
+        # already an identity check.
+        if self.lock_id and decoded.lock_id != self.lock_id:
             return
         # Track the current RPA so the GATT path uses the live address, not
         # whatever address was around at config-flow time.
@@ -157,6 +166,11 @@ class SCKCoordinator:
 
         Uses the user's chosen short-range scanner when set, else lets HA
         pick the connectable scanner with the best RSSI.
+
+        On the first call after a partial registration, this also
+        backfills any missing credentials (adv_data_key, lock_id,
+        smartphone_id) that the lock didn't return notifies for during
+        the registration window — reusing the same authenticated session.
         """
         async with self._action_lock:
             ble_device = self._pick_connectable_ble_device()
@@ -171,11 +185,83 @@ class SCKCoordinator:
                 ok = await client.verify_pin(self._pin)
                 if not ok:
                     raise RuntimeError("PIN rejected by lock")
+                await self._backfill_if_needed(client)
+                if not self.lock_id:
+                    raise RuntimeError(
+                        "lock_id is unknown and could not be read from the lock — "
+                        "set_state requires it. Try the registration flow again."
+                    )
                 await client.set_state(target_state, self.lock_id)
-            # Optimistically reflect the commanded state until the next adv arrives.
             if self.latest is not None:
                 self.latest = _replace_locked(self.latest, target_state)
             async_dispatcher_send(self.hass, self.signal)
+
+    async def async_ensure_credentials(self) -> None:
+        """Open an authenticated session and backfill any missing fields.
+
+        Useful for triggering a backfill outside of a lock/unlock action,
+        e.g. from a button entity or a setup-time best-effort task. No-op
+        if nothing is missing.
+        """
+        if self._adv_key and self.lock_id and self.entry.data.get(CONF_SMARTPHONE_ID):
+            return
+        async with self._action_lock:
+            if self._adv_key and self.lock_id and self.entry.data.get(
+                CONF_SMARTPHONE_ID
+            ):
+                return
+            ble_device = self._pick_connectable_ble_device()
+            if ble_device is None:
+                raise RuntimeError(
+                    f"Lock {self.address} is not currently reachable for a GATT "
+                    "connection on the selected short-range adapter."
+                )
+            async with SCKTransport(ble_device) as transport:
+                client = SCKClient(transport)
+                ok = await client.verify_pin(self._pin)
+                if not ok:
+                    raise RuntimeError("PIN rejected by lock")
+                await self._backfill_if_needed(client)
+
+    async def _backfill_if_needed(self, client: SCKClient) -> None:
+        """Fill in adv_data_key / lock_id / smartphone_id if absent.
+
+        Caller must hold ``_action_lock`` and have already verified the PIN
+        on ``client``. Persists any successfully-read values to the config
+        entry so the backfill is one-shot.
+        """
+        new_data: dict | None = None
+        if not self._adv_key:
+            try:
+                key = await client.request_adv_data_key()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("adv_data_key backfill failed: %s", err)
+            else:
+                self._adv_key = bytes(key)
+                new_data = new_data or dict(self.entry.data)
+                new_data[CONF_ADV_DATA_KEY] = self._adv_key.hex()
+                _LOGGER.info("Backfilled adv_data_key from lock")
+        if not self.lock_id:
+            try:
+                lid = await client.request_lock_id()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("lock_id backfill failed: %s", err)
+            else:
+                self.lock_id = lid
+                new_data = new_data or dict(self.entry.data)
+                new_data[CONF_LOCK_ID] = lid
+                _LOGGER.info("Backfilled lock_id=%s from lock", lid)
+        if not self.entry.data.get(CONF_SMARTPHONE_ID):
+            try:
+                sid = await client.request_smartphone_id()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("smartphone_id backfill failed: %s", err)
+            else:
+                new_data = new_data or dict(self.entry.data)
+                new_data[CONF_SMARTPHONE_ID] = bytes(sid).hex()
+                _LOGGER.info("Backfilled smartphone_id from lock")
+        if new_data is not None:
+            self.hass.config_entries.async_update_entry(self.entry, data=new_data)
 
     def _pick_connectable_ble_device(self):
         short_source = self.short_range_source

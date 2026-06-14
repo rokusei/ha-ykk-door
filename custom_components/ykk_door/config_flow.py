@@ -24,7 +24,6 @@ unusual install paths.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import sys
@@ -360,8 +359,13 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during SCK registration")
                 errors["base"] = "unknown"
             else:
+                title = (
+                    f"YKK Lock {result['lock_id']}"
+                    if result["lock_id"]
+                    else f"YKK Lock ({self._address})"
+                )
                 return self.async_create_entry(
-                    title=f"YKK Lock {result['lock_id']}",
+                    title=title,
                     data={
                         CONF_ADDRESS: self._address,
                         CONF_PIN: pin,
@@ -394,22 +398,19 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     async def _run_registration(self, pin: str, name: str) -> dict[str, str]:
-        """Two-phase GATT registration.
+        """Run the GATT registration handshake on a single connection.
 
-        Phase 1: in the lock's brief post-pair window (~200ms over a BT
-        proxy), pipeline the state-changing writes — enter, RegisterPin,
-        RegisterName — fire-and-forget. The lock processes whatever
-        reaches it before its internal watchdog tears the link down; we
-        don't try to collect notification ACKs back in this window because
-        we can't reliably squeeze them through.
+        Everything has to land on the same connection inside the lock's
+        ~200ms post-pair window: enter, RegisterPin/Name (writes), and
+        the RequestAdvDataKey/LockId/SmartphoneId reads. Reconnects burn
+        the registration window and the second pair() often fails on
+        backend bond reuse — single session is the reliable path.
 
-        Phase 2: after the lock disconnects, reconnect (the bond should
-        be reused — observed `LTK USED INSTEAD OF STK` in the proxy logs)
-        and read back what we need to operate the lock: verify_pin
-        (authenticates + confirms phase 1 committed), lock_id,
-        smartphone_id, adv_data_key. The lock is no longer in registration
-        mode and the watchdog no longer applies, so these run sequentially
-        with no time pressure.
+        Responses are partial — the lock typically returns a notify only
+        for ``enter`` plus a handful of the requests, never all six.
+        Whatever didn't come back is stored as ``""`` in the entry and
+        the coordinator backfills it on the first authenticated GATT
+        session (see ``SCKCoordinator.async_ensure_credentials``).
 
         Returns plain-str fields suitable for storing in the config entry.
         """
@@ -424,35 +425,16 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
-        # === Phase 1: writes inside the registration window
-        # skip_notify=True drops the ~86ms start_notify CCCD write that
-        # otherwise eats most of the lock's ~243ms post-pair watchdog
-        # window before the pipeline-fire even starts. Phase 1 is
-        # fire-and-forget so a subscription buys nothing.
-        async with SCKTransport(
-            ble_device, response_timeout=10.0, skip_notify=True
-        ) as transport:
-            client = SCKClient(transport)
-            await client.register_phase1_writes(pin, name=name)
-
-        # Brief pause: ESPHome proxy needs to free the BLE connection slot
-        # after the lock's own disconnect propagates through. ~7s was
-        # observed in the 0.1.11 traces; bleak_retry_connector retries
-        # internally so this is mostly a courtesy.
-        await asyncio.sleep(2.0)
-
-        # Re-resolve in case the BLE address rotated (RPAs do)
-        ble_device = self._pick_ble_device() or ble_device
-
-        # === Phase 2: authenticated reads on a fresh connection
         async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
-            result = await client.register_phase2_reads(pin)
+            result = await client.register(pin, name=name)
 
         return {
-            "lock_id": result.lock_id,
-            "adv_data_key": result.adv_data_key.hex(),
-            "smartphone_id": result.smartphone_id.hex(),
+            "lock_id": result.lock_id or "",
+            "adv_data_key": result.adv_data_key.hex() if result.adv_data_key else "",
+            "smartphone_id": (
+                result.smartphone_id.hex() if result.smartphone_id else ""
+            ),
         }
 
     def _pick_ble_device(self):

@@ -76,14 +76,12 @@ class SCKTransport:
         connect_timeout: float = 30.0,
         max_connect_attempts: int = 3,
         device_lookup: Callable[[], BLEDevice | None] | None = None,
-        skip_notify: bool = False,
     ):
         self._target = device
         self._response_timeout = response_timeout
         self._connect_timeout = connect_timeout
         self._max_attempts = max_connect_attempts
         self._device_lookup = device_lookup
-        self._skip_notify = skip_notify
         self._client: BleakClient | None = None
         self._notify_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -144,19 +142,15 @@ class SCKTransport:
                 f"associations (or factory-reset the lock if associations "
                 f"don't clear the BLE bond), then retry."
             ) from e
-        if not self._skip_notify:
-            await self._client.start_notify(NOTIFY_UUID, self._on_notify)
-        else:
-            _LOGGER.debug("Skipping start_notify (fire-and-forget mode)")
+        await self._client.start_notify(NOTIFY_UUID, self._on_notify)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._client is not None and self._client.is_connected:
-            if not self._skip_notify:
-                try:
-                    await self._client.stop_notify(NOTIFY_UUID)
-                except Exception:
-                    pass
+            try:
+                await self._client.stop_notify(NOTIFY_UUID)
+            except Exception:
+                pass
             try:
                 await self._client.disconnect()
             except Exception:
@@ -191,48 +185,6 @@ class SCKTransport:
             ) from e
         return parse_frame(data)
 
-    async def write_pipeline_fire(
-        self, frames: list[bytes], *, settle: float = 0.3
-    ) -> None:
-        """Pipeline writes fire-and-forget — no notification waiting.
-
-        Used for the registration writes phase where the lock's hard
-        ~200ms post-pair window can't fit both the writes and their
-        notifications back. We dispatch all writes via gather +
-        write-without-response (so each returns immediately at the API
-        layer) and then sleep `settle` seconds for the proxy to flush
-        the BLE queue and the lock to commit state, before the caller
-        tears the connection down.
-
-        The lock may or may not process all writes — that's accepted.
-        Phase 2 (reads on a fresh connection) verifies state.
-        """
-        if self._client is None:
-            raise RuntimeError("transport not entered")
-        loop = asyncio.get_event_loop()
-        t_start = loop.time()
-        write_results = await asyncio.gather(
-            *(
-                self._client.write_gatt_char(WRITE_UUID, frame, response=False)
-                for frame in frames
-            ),
-            return_exceptions=True,
-        )
-        for i, r in enumerate(write_results):
-            if isinstance(r, BaseException):
-                raise BleakError(
-                    f"pipeline-fire write {i + 1}/{len(frames)} "
-                    f"({frames[i][:2].hex()}) failed after "
-                    f"{(loop.time() - t_start) * 1000:.0f}ms: {r}"
-                ) from r
-        _LOGGER.debug(
-            "Pipeline-fire dispatched %d writes in %.0fms, settling %.0fms",
-            len(frames),
-            (loop.time() - t_start) * 1000,
-            settle * 1000,
-        )
-        await asyncio.sleep(settle)
-
     async def write_pipeline(
         self,
         frames: list[bytes],
@@ -261,15 +213,16 @@ class SCKTransport:
         lock never sees them. Symptom: zero notifications + no beep. Pass
         `write_response=True` to fall back to the safer mode.
 
-        Responses are matched to frames by index — the lock processes
-        commands sequentially per the RN app's saga code, so notify
-        arrival order tracks write order.
+        Tolerant of partial responses: collects whatever notifies arrive
+        within ``timeout`` seconds and returns them, in arrival order.
+        The caller is expected to demux by opcode prefix — the lock may
+        deliver fewer notifications than there were writes, and the
+        order isn't guaranteed to track write order either.
         """
         if self._client is None:
             raise RuntimeError("transport not entered")
         if timeout is None:
             timeout = self._response_timeout
-        # Drain stale notifications
         while not self._notify_queue.empty():
             self._notify_queue.get_nowait()
 
@@ -301,25 +254,16 @@ class SCKTransport:
 
         results: list[bytes] = []
         deadline = t_start + timeout
-        for i in range(len(frames)):
-            remaining = max(0.0, deadline - loop.time())
+        while len(results) < len(frames):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
                 data = await asyncio.wait_for(
                     self._notify_queue.get(), timeout=remaining
                 )
-            except asyncio.TimeoutError as e:
-                # Surface the partial responses so we can tell which
-                # commands the lock processed before disconnecting.
-                got_hex = (
-                    ", ".join(r[:2].hex() for r in results)
-                    if results
-                    else "(none)"
-                )
-                raise TimeoutError(
-                    f"pipeline timeout: got {len(results)}/{len(frames)} "
-                    f"responses within {timeout}s "
-                    f"(received opcodes: {got_hex})"
-                ) from e
+            except asyncio.TimeoutError:
+                break
             body = parse_frame(data)
             _LOGGER.debug(
                 "Pipeline notify %d/%d at +%.0fms: %s",
@@ -330,8 +274,9 @@ class SCKTransport:
             )
             results.append(body)
         _LOGGER.debug(
-            "Pipeline collected %d responses in %.0fms (total %.0fms)",
+            "Pipeline collected %d/%d responses in %.0fms (total %.0fms)",
             len(results),
+            len(frames),
             (loop.time() - t_writes_done) * 1000,
             (loop.time() - t_start) * 1000,
         )
