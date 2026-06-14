@@ -28,6 +28,7 @@ class Cmd(IntEnum):
     VERIFY_PIN = 0x8313
     SET_LOCK_STATE = 0x8003       # 3rd byte: 0x01 lock, 0x02 unlock
     SET_TIMESTAMP = 0x8102
+    SET_APP_VERSION = 0x8103
     # settings.registrationMode.{enter,exit}.adminSmartphone — must be the
     # first frame sent once the lock is in its physical registration window;
     # the lock silently ignores every other command until it accepts this.
@@ -94,6 +95,30 @@ def set_timestamp(when: _dt.datetime | None = None) -> bytes:
     when = when or _dt.datetime.now()
     payload = when.strftime("%Y%m%d%H%M").encode("ascii")
     return build_frame(_two(Cmd.SET_TIMESTAMP) + payload)
+
+
+def set_app_version(version: str = "2.1.1") -> bytes:
+    """App version frame.
+
+    Encoding observed in the decompiled RN app (registerLockStep1):
+    version.split('.').map(s => s.charCodeAt(0)) — i.e. the first ASCII
+    character of each dotted segment. Single-digit segments only.
+    iOS 2.1.1 → bytes [0x32, 0x31, 0x31].
+    """
+    payload = bytes(ord(s[0]) for s in version.split("."))
+    return build_frame(_two(Cmd.SET_APP_VERSION) + payload)
+
+
+def request_name() -> bytes:
+    return build_frame(_two(Cmd.REQUEST_NAME))
+
+
+def register_name(name: str) -> bytes:
+    return build_frame(_two(Cmd.REGISTER_NAME) + name.encode("utf-16-le"))
+
+
+def request_adv_data_key() -> bytes:
+    return build_frame(_two(Cmd.REQUEST_ADV_DATA_KEY))
 
 
 def enter_registration_mode_admin() -> bytes:

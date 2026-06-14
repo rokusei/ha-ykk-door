@@ -7,17 +7,19 @@ from enum import IntEnum
 import datetime as _dt
 
 from .commands import (
-    Cmd,
     enter_registration_mode_admin as _build_enter_reg_mode,
     exit_registration_mode_admin as _build_exit_reg_mode,
-    request_lock_id as _build_request_lock_id,
-    request_smartphone_id as _build_request_smartphone_id,
+    register_name as _build_register_name,
     register_pin as _build_register_pin,
-    verify_pin as _build_verify_pin,
+    request_adv_data_key as _build_request_adv_data_key,
+    request_lock_id as _build_request_lock_id,
+    request_name as _build_request_name,
+    request_smartphone_id as _build_request_smartphone_id,
+    set_app_version as _build_set_app_version,
     set_lock_state as _build_set_lock_state,
     set_timestamp as _build_set_timestamp,
+    verify_pin as _build_verify_pin,
 )
-from .frames import build_frame
 from .transport import SCKTransport
 
 
@@ -57,6 +59,33 @@ class SCKClient:
         body = await self._send(_build_set_timestamp(when))
         # ACK: 01 02 (mirrors 81 02 with high bit dropped)
         self._check_ack(body, 0x01, 0x02)
+
+    async def set_app_version(self, version: str = "2.1.1") -> bool:
+        """Send SetAppVersion. Returns True if the lock considers the version
+        valid (registerLockStep1 checks `validAppVersion !== 0`; if zero the
+        app dispatches REGISTER_LOCK_STEP_FAILED)."""
+        body = await self._send(_build_set_app_version(version))
+        # ACK: 01 03 + validAppVersion byte
+        payload = self._check_ack(body, 0x01, 0x03)
+        return bool(payload) and payload[0] != 0
+
+    async def request_adv_data_key(self) -> bytes:
+        body = await self._send(_build_request_adv_data_key())
+        # Response: 00 10 <16 key bytes>
+        return self._check_ack(body, 0x00, 0x10)[:16]
+
+    async def request_name(self) -> bytes:
+        """Read the lock's currently stored name. Step2 in the app's flow does
+        this purely to surface the lock name in the UI — the registration
+        succeeds whether or not we use the value."""
+        body = await self._send(_build_request_name())
+        # ACK: 03 23 + payload (name in UTF-16 LE, length-prefixed)
+        return self._check_ack(body, 0x03, 0x23)
+
+    async def register_name(self, name: str) -> None:
+        body = await self._send(_build_register_name(name))
+        # ACK: 03 22 (mirrors 83 22)
+        self._check_ack(body, 0x03, 0x22)
 
     async def request_lock_id(self) -> str:
         body = await self._send(_build_request_lock_id())
@@ -120,43 +149,48 @@ class SCKClient:
         body = await self._send(_build_exit_reg_mode())
         self._check_ack(body, 0x03, 0x44)
 
-    async def register(self, pin: str, name: str = "SCK") -> RegistrationResult:
-        """Full admin-smartphone enrollment in one connection.
+    async def register(
+        self, pin: str, name: str = "SCK", app_version: str = "2.1.1"
+    ) -> RegistrationResult:
+        """Full admin-smartphone (managementPhone) enrollment in one
+        connection. Mirrors the RN app's enterSmartphoneRegistrationMode +
+        registerLockStep1/2/3 sagas exactly for `registrationMode ===
+        managementPhone` (=1) and `productCode === 2`.
 
-        The lock briefly accepts data-exchange commands after it ACKs
-        EnterRegistrationModeAdminSmartphone (0x8343) and tears the link
-        down shortly after. We have to push the entire sequence through on
-        this single connection before that happens — once the lock has
-        beeped and exited registration mode, subsequent reconnects are
-        treated as normal authenticated sessions and the registration
-        opcodes are silently ignored.
+        Wire sequence after pair+notify, all on the same link:
+          enter (0x8343)  → ack 03 43 01 (lock beeps)
+          SetAppVersion   → ack 01 03, validAppVersion must be non-zero
+          SetTimestamp    → ack 01 02
+          RequestAdvDataKey → 00 10 <16-byte key>
+          RequestLockId   → 03 42 ...
+          RequestSmartphoneId → 03 41 ...
+          RegisterPin     → 03 12 ...
+          RequestName     → 03 23 ... (Step2 — read existing name, discarded)
+          RegisterName    → 03 22 ... (Step3 — write the new name)
 
         Requires the lock to be in registration mode (press the physical
         button) at the time of the call.
         """
-        # 0. Claim the admin-smartphone slot. The lock beeps on success.
+        # === Step "action 1" — enterSmartphoneRegistrationMode (lock beeps)
         rc = await self.enter_registration_mode_admin()
         if rc != 1:
             raise RuntimeError(
                 f"lock refused admin-smartphone registration (response code {rc})"
             )
-        # 1. Get adv-data key
-        body = await self._send(build_frame(Cmd.REQUEST_ADV_DATA_KEY.to_bytes(2, "big")))
-        # Response: 00 10 <16 key bytes>
-        payload = self._check_ack(body, 0x00, 0x10)
-        adv_data_key = payload[:16]
-        # 2. Get lock ID
+        # === Step 1 — registerLockStep1 (managementPhone, productCode=2)
+        if not await self.set_app_version(app_version):
+            raise RuntimeError(
+                f"lock rejected app version {app_version!r} (validAppVersion=0)"
+            )
+        await self.set_timestamp()
+        adv_data_key = await self.request_adv_data_key()
         lock_id = await self.request_lock_id()
-        # 3. Get smartphone slot (issued by lock)
         smartphone_id = await self.request_smartphone_id()
-        # 4. Register PIN
+        # === Step 2 — registerLockStep2 (registerPin + RequestName-read)
         await self.register_pin(pin)
-        # 5. Register name (UTF-16 LE, observed)
-        name_bytes = name.encode("utf-16-le")
-        register_name_frame = build_frame(
-            Cmd.REGISTER_NAME.to_bytes(2, "big") + name_bytes
-        )
-        await self._send(register_name_frame)
+        await self.request_name()
+        # === Step 3 — registerLockStep3 (registerLockName-write)
+        await self.register_name(name)
         return RegistrationResult(
             lock_id=lock_id,
             adv_data_key=adv_data_key,
