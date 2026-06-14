@@ -166,6 +166,72 @@ class SCKTransport:
             ) from e
         return parse_frame(data)
 
+    async def write_pipeline(
+        self, frames: list[bytes], *, timeout: float | None = None
+    ) -> list[bytes]:
+        """Send `frames` back-to-back without waiting for notify responses
+        between writes, then collect one notification per write in order.
+
+        Used for the lock's post-pair registration window, which is too
+        small (~230ms over a BT proxy) for the per-frame write→wait-notify
+        pattern. The SCK write characteristic is write-with-response only,
+        so we can't fully fire-and-forget — each write still awaits its
+        BLE-level write response — but the application-level notify wait
+        per write (1-2 conn intervals) is skipped, which collapses several
+        hundred ms of total wall-clock.
+
+        Responses are matched to frames by index: the lock processes
+        commands sequentially per the RN app's saga code (`writeAndWait`
+        chains in `registerLockStep1`), so notify order matches write
+        order.
+        """
+        if self._client is None:
+            raise RuntimeError("transport not entered")
+        if timeout is None:
+            timeout = self._response_timeout
+        # Drain stale notifications
+        while not self._notify_queue.empty():
+            self._notify_queue.get_nowait()
+
+        loop = asyncio.get_event_loop()
+        t_start = loop.time()
+        for i, frame in enumerate(frames):
+            try:
+                await self._client.write_gatt_char(WRITE_UUID, frame, response=True)
+            except BleakError as e:
+                raise BleakError(
+                    f"pipeline write {i + 1}/{len(frames)} ({frame[:2].hex()}) "
+                    f"failed after {(loop.time() - t_start) * 1000:.0f}ms: {e}"
+                ) from e
+        t_writes_done = loop.time()
+        _LOGGER.debug(
+            "Pipeline dispatched %d writes in %.0fms",
+            len(frames),
+            (t_writes_done - t_start) * 1000,
+        )
+
+        results: list[bytes] = []
+        deadline = t_start + timeout
+        for i in range(len(frames)):
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                data = await asyncio.wait_for(
+                    self._notify_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    f"pipeline timeout: got {len(results)}/{len(frames)} "
+                    f"responses within {timeout}s"
+                ) from e
+            results.append(parse_frame(data))
+        _LOGGER.debug(
+            "Pipeline collected %d responses in %.0fms (total %.0fms)",
+            len(results),
+            (loop.time() - t_writes_done) * 1000,
+            (loop.time() - t_start) * 1000,
+        )
+        return results
+
 
 @asynccontextmanager
 async def open_transport(

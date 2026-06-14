@@ -152,10 +152,14 @@ class SCKClient:
     async def register(
         self, pin: str, name: str = "SCK", app_version: str = "2.1.1"
     ) -> RegistrationResult:
-        """Full admin-smartphone (managementPhone) enrollment in one
-        connection. Mirrors the RN app's enterSmartphoneRegistrationMode +
-        registerLockStep1/2/3 sagas exactly for `registrationMode ===
-        managementPhone` (=1) and `productCode === 2`.
+        """Full admin-smartphone (managementPhone) enrollment, pipelined.
+
+        Builds all 9 frames upfront (enter + Step1×5 + Step2×2 + Step3×1)
+        and ships them through the transport pipeline so the entire sequence
+        fits in the lock's ~230ms post-pair window. Responses are validated
+        only after the full pipeline completes; if `enter` is rejected
+        (rc != 1) we still consume the rest of the pipeline, but the lock
+        rejects subsequent frames as well, so no state changes on the lock.
 
         Wire sequence after pair+notify, all on the same link:
           enter (0x8343)  → ack 03 43 01 (lock beeps)
@@ -171,26 +175,43 @@ class SCKClient:
         Requires the lock to be in registration mode (press the physical
         button) at the time of the call.
         """
-        # === Step "action 1" — enterSmartphoneRegistrationMode (lock beeps)
-        rc = await self.enter_registration_mode_admin()
+        frames = [
+            _build_enter_reg_mode(),
+            _build_set_app_version(app_version),
+            _build_set_timestamp(),
+            _build_request_adv_data_key(),
+            _build_request_lock_id(),
+            _build_request_smartphone_id(0),
+            _build_register_pin(pin),
+            _build_request_name(),
+            _build_register_name(name),
+        ]
+        responses = await self._t.write_pipeline(frames)
+
+        # Validate in pipeline order. _check_ack raises ValueError on bad
+        # prefix; the chain below catches per-stage failures so the error
+        # message tells you which command the lock rejected.
+        enter_payload = self._check_ack(responses[0], 0x03, 0x43)
+        rc = enter_payload[0] if enter_payload else 0
         if rc != 1:
             raise RuntimeError(
                 f"lock refused admin-smartphone registration (response code {rc})"
             )
-        # === Step 1 — registerLockStep1 (managementPhone, productCode=2)
-        if not await self.set_app_version(app_version):
+        av_payload = self._check_ack(responses[1], 0x01, 0x03)
+        if not av_payload or av_payload[0] == 0:
             raise RuntimeError(
                 f"lock rejected app version {app_version!r} (validAppVersion=0)"
             )
-        await self.set_timestamp()
-        adv_data_key = await self.request_adv_data_key()
-        lock_id = await self.request_lock_id()
-        smartphone_id = await self.request_smartphone_id()
-        # === Step 2 — registerLockStep2 (registerPin + RequestName-read)
-        await self.register_pin(pin)
-        await self.request_name()
-        # === Step 3 — registerLockStep3 (registerLockName-write)
-        await self.register_name(name)
+        self._check_ack(responses[2], 0x01, 0x02)  # SetTimestamp
+        adv_data_key = self._check_ack(responses[3], 0x00, 0x10)[:16]
+        lid_payload = self._check_ack(responses[4], 0x03, 0x42)
+        if lid_payload and lid_payload[0] == 0x82:
+            lid_payload = lid_payload[1:]
+        lock_id = lid_payload.split(b"\x00", 1)[0].decode("ascii")
+        smartphone_id = self._check_ack(responses[5], 0x03, 0x41)
+        self._check_ack(responses[6], 0x03, 0x12)  # RegisterPin
+        self._check_ack(responses[7], 0x03, 0x23)  # RequestName (discarded)
+        self._check_ack(responses[8], 0x03, 0x22)  # RegisterName
         return RegistrationResult(
             lock_id=lock_id,
             adv_data_key=adv_data_key,
