@@ -192,30 +192,33 @@ class SCKClient:
         post-pair watchdog no longer applies.
 
         Sequence:
-          1. request_lock_id — probe that the lock is responsive on this
-             reconnected session at all. Times out only if the lock is
-             ignoring everything (broader issue than just PIN).
-          2. verify_pin — both authenticates this session and confirms
-             phase 1's RegisterPin actually committed. Returns False (NG)
-             rather than timing out if the PIN is wrong / unset.
-          3. request_smartphone_id, request_adv_data_key — fill in the
-             rest of the data the integration needs.
+          1. verify_pin — both authenticates this session and probes
+             whether phase 1's RegisterPin actually committed. Lock
+             returns 03 13 01 (OK) / 03 13 02 (NG) — neither hangs the
+             session like a silent post-pair command would. Also doubles
+             as a session-auth handshake the lock may require before
+             allowing other commands.
+          2. request_lock_id, request_smartphone_id, request_adv_data_key
+             — fill in the rest of the registration data.
         """
         try:
-            lock_id = await self.request_lock_id()
+            verified = await self.verify_pin(pin)
         except TimeoutError as e:
             raise RuntimeError(
-                "phase 2: lock did not respond to request_lock_id. Bond "
-                "may not be reused, or the lock requires another auth "
-                "step we are not sending."
+                "phase 2: lock did not respond to verify_pin (10s timeout). "
+                "Bond may not be reused, lock may be in a degraded state, "
+                "or the SCK protocol requires another session-init step "
+                "we are not sending."
             ) from e
-        if not await self.verify_pin(pin):
+        if not verified:
             raise RuntimeError(
                 "phase 2: verify_pin returned NG — phase 1's RegisterPin "
-                "did not commit. Lock is responsive (got lock_id) but the "
-                "PIN we set is not the one the lock knows. Retry "
-                "registration."
+                "did not commit on the lock. The lock responded but the "
+                "PIN we tried to set is not the one it knows. Phase 1 "
+                "writes may not be landing within the post-pair window — "
+                "drop to fewer frames and retry."
             )
+        lock_id = await self.request_lock_id()
         smartphone_id = await self.request_smartphone_id()
         adv_data_key = await self.request_adv_data_key()
         return RegistrationResult(
