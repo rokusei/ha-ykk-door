@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 import datetime as _dt
+
+_LOGGER = logging.getLogger(__name__)
 
 from .commands import (
     enter_registration_mode_admin as _build_enter_reg_mode,
@@ -48,8 +51,8 @@ class SCKClient:
         self._t = transport
 
     # --- low-level helpers ----------------------------------------------
-    async def _send(self, frame: bytes) -> bytes:
-        return await self._t.write_and_wait(frame)
+    async def _send(self, frame: bytes, *, timeout: float | None = None) -> bytes:
+        return await self._t.write_and_wait(frame, timeout=timeout)
 
     @staticmethod
     def _check_ack(body: bytes, expect_first: int, expect_second: int) -> bytes:
@@ -127,71 +130,111 @@ class SCKClient:
     async def register(
         self, pin: str, name: str = "SCK"
     ) -> RegistrationResult:
-        """Admin-smartphone (managementPhone) enrollment, pipelined.
+        """Admin-smartphone (managementPhone) enrollment, sequential per
+        iOS RN app saga (registerLockStep1/2/3, decompiled.js ~287100).
 
-        Trimmed from the full RN app saga to fit the lock's hard ~200ms
-        post-pair window: drops SetAppVersion (productCode=2 only — our
-        lock's productCode is unconfirmed, and 0.1.16 traces showed the
-        lock never returned a notify for opcode 0103) and SetTimestamp
-        (same — no 0102 notify ever observed). The lock also delivers
-        notifications out-of-order relative to the write sequence
-        (observed 0010 arriving before 0343), so we match responses by
-        opcode prefix rather than pipeline index.
+        Two big differences from v0.1.17-0.1.23:
 
-        Wire sequence after pair+notify (6 frames, all on the same link):
-          enter (0x8343)         → 03 43 01 (lock beeps)
+        1. **No EnterRegistrationModeAdminSmartphone (0x8343)**. The
+           iOS app's registerLockStep1 doesn't send it for admin
+           registration — the physical button press IS the
+           reg-mode-enter. Sending 0x8343 burned ~119ms of conn-event
+           budget for nothing, leaving the actually-important PIN/Name
+           writes to miss the lock's ~200ms post-pair window.
+
+        2. **Sequential writeAndWait** (not pipelined gather +
+           write-without-response). Each frame waits for its specific
+           ack before the next is sent — so the lock has a chance to
+           commit each command, and we know whether PIN actually
+           registered.
+
+        Wire sequence after pair+notify, all on one link:
           RequestAdvDataKey      → 00 10 <16-byte key>
           RequestLockId          → 03 42 ...
           RequestSmartphoneId    → 03 41 ...
-          RegisterPin            → 03 12 ...
+          RegisterPin            → 03 12 ...  (MUST succeed)
           RegisterName           → 03 22 ...
 
-        Tolerates partial responses: only ``enter`` is required (it's the
-        signal that the lock accepted reg-mode and beeped). Any read
-        whose notification didn't make it back in the window is returned
-        as ``None`` — the coordinator backfills on the first
-        authenticated session.
-        """
-        frames = [
-            _build_enter_reg_mode(),
-            _build_request_adv_data_key(),
-            _build_request_lock_id(),
-            _build_request_smartphone_id(0),
-            _build_register_pin(pin),
-            _build_register_name(name),
-        ]
-        responses = await self._t.write_pipeline(frames)
-        by_prefix = {bytes(r[:2]): r for r in responses}
+        SetTimestamp (0x8102) and SetAppVersion (0x8103) are omitted —
+        the iOS app sends them but our lock never returns a notify, so
+        writeAndWait would hang. (Lock likely silently processes them
+        either way; they're not load-bearing for managementPhone.)
 
-        enter_body = by_prefix.get(b"\x03\x43")
-        if enter_body is None:
-            got = ", ".join(p.hex() for p in by_prefix) or "none"
-            raise RuntimeError(
-                "lock did not ack EnterRegistrationModeAdminSmartphone "
-                f"(received opcodes: {got}). Press the physical button to "
-                "enter registration mode and retry."
-            )
-        enter_payload = self._check_ack(enter_body, 0x03, 0x43)
-        rc = enter_payload[0] if enter_payload else 0
-        if rc != 1:
-            raise RuntimeError(
-                f"lock refused admin-smartphone registration (response code {rc})"
-            )
+        Tolerant of read timeouts (AdvDataKey / LockId / SmartphoneId):
+        if any read times out, the field comes back as None and the
+        coordinator backfills lazily on the first authenticated
+        session. RegisterPin MUST succeed — without it the lock has no
+        record of us and would reject subsequent connections.
+        """
+        # 2s per-frame: healthy RTT to the lock is ~120ms; 2s leaves
+        # generous slack for queueing/proxy WiFi jitter without
+        # multi-minute hangs if the connection has died.
+        FRAME_TIMEOUT = 2.0
 
         adv_data_key: bytes | None = None
-        if (body := by_prefix.get(b"\x00\x10")) is not None:
-            adv_data_key = self._check_ack(body, 0x00, 0x10)[:16]
-
         lock_id: str | None = None
-        if (body := by_prefix.get(b"\x03\x42")) is not None:
-            lid_payload = self._check_ack(body, 0x03, 0x42)
-            if lid_payload and lid_payload[0] == 0x82:
-                lid_payload = lid_payload[1:]
-            lock_id = lid_payload.split(b"\x00", 1)[0].decode("ascii")
-
         smartphone_id: bytes | None = None
-        if (body := by_prefix.get(b"\x03\x41")) is not None:
+
+        # --- Step1-equivalent: reads ---
+        try:
+            body = await self._send(
+                _build_request_adv_data_key(), timeout=FRAME_TIMEOUT
+            )
+            adv_data_key = self._check_ack(body, 0x00, 0x10)[:16]
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning("RequestAdvDataKey did not return cleanly: %s", e)
+
+        try:
+            body = await self._send(
+                _build_request_lock_id(), timeout=FRAME_TIMEOUT
+            )
+            payload = self._check_ack(body, 0x03, 0x42)
+            if payload and payload[0] == 0x82:
+                payload = payload[1:]
+            lock_id = payload.split(b"\x00", 1)[0].decode("ascii")
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning("RequestLockId did not return cleanly: %s", e)
+
+        try:
+            body = await self._send(
+                _build_request_smartphone_id(0), timeout=FRAME_TIMEOUT
+            )
             smartphone_id = bytes(self._check_ack(body, 0x03, 0x41))
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning("RequestSmartphoneId did not return cleanly: %s", e)
+
+        # --- Step2-equivalent: write PIN ---
+        # This MUST succeed: it's what binds our bonded peer to a
+        # smartphone slot on the lock. Without it, every subsequent
+        # auth-required command (verify_pin, set_lock_state) is rejected.
+        try:
+            body = await self._send(
+                _build_register_pin(pin), timeout=FRAME_TIMEOUT
+            )
+            self._check_ack(body, 0x03, 0x12)
+        except TimeoutError as e:
+            raise RuntimeError(
+                "RegisterPin did not ack within "
+                f"{FRAME_TIMEOUT}s. The lock probably disconnected before "
+                "processing the PIN write — registration did NOT complete. "
+                "Press the physical button again and retry. If this keeps "
+                "happening, the post-pair window is too tight for sequential "
+                "writes and we need to split into separate connections per "
+                "iOS-app Step1/Step2/Step3."
+            ) from e
+
+        # --- Step3-equivalent: write name (best-effort, lock has us now) ---
+        try:
+            body = await self._send(
+                _build_register_name(name), timeout=FRAME_TIMEOUT
+            )
+            self._check_ack(body, 0x03, 0x22)
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning(
+                "RegisterName did not ack (registration still succeeded, "
+                "lock name will be its previous value): %s",
+                e,
+            )
 
         return RegistrationResult(
             lock_id=lock_id,

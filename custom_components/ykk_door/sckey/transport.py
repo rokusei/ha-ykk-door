@@ -166,121 +166,33 @@ class SCKTransport:
     def _on_notify(self, _char, data: bytearray) -> None:
         self._notify_queue.put_nowait(bytes(data))
 
-    async def write_and_wait(self, frame: bytes) -> bytes:
+    async def write_and_wait(
+        self, frame: bytes, *, timeout: float | None = None
+    ) -> bytes:
         """Write `frame` to the characteristic and return the next notification
-        body (CRC-verified, with the CRC bytes stripped)."""
-        if self._client is None:
-            raise RuntimeError("transport not entered")
-        # Drain any stale notifications before sending a new request
-        while not self._notify_queue.empty():
-            self._notify_queue.get_nowait()
-        await self._client.write_gatt_char(WRITE_UUID, frame, response=True)
-        try:
-            data = await asyncio.wait_for(
-                self._notify_queue.get(), timeout=self._response_timeout
-            )
-        except asyncio.TimeoutError as e:
-            raise TimeoutError(
-                f"no notification within {self._response_timeout}s for write {frame.hex()}"
-            ) from e
-        return parse_frame(data)
+        body (CRC-verified, with the CRC bytes stripped).
 
-    async def write_pipeline(
-        self,
-        frames: list[bytes],
-        *,
-        timeout: float | None = None,
-        write_response: bool = False,
-    ) -> list[bytes]:
-        """Dispatch `frames` concurrently, then collect one notification per
-        write in order.
-
-        Used for the lock's post-pair registration window (~220ms over a BT
-        proxy) which is too tight for any sequential write pattern. Two
-        compounding optimisations vs 0.1.14:
-
-        * **asyncio.gather** dispatches all writes in parallel at the API
-          layer (the proxy still serialises at BLE, but the per-write WiFi
-          round-trip stops being on the critical path).
-        * **write_response=False** issues ATT write-without-response, so
-          each write returns immediately at the API layer (no BLE-level
-          ATT ACK wait). Multiple short writes fit in 1-2 BLE conn events
-          as LL data PDUs.
-
-        Risk: if the SCK write characteristic only declares
-        write-with-response, write-without-response is silently dropped on
-        the lock side — the writes "succeed" at the API layer but the
-        lock never sees them. Symptom: zero notifications + no beep. Pass
-        `write_response=True` to fall back to the safer mode.
-
-        Tolerant of partial responses: collects whatever notifies arrive
-        within ``timeout`` seconds and returns them, in arrival order.
-        The caller is expected to demux by opcode prefix — the lock may
-        deliver fewer notifications than there were writes, and the
-        order isn't guaranteed to track write order either.
-        """
+        `timeout` overrides the transport's configured response_timeout. Used
+        by the registration flow which needs short per-frame deadlines (the
+        lock disconnects ~200ms post-pair regardless of whether we're
+        waiting on it; 10s per-frame waits compound into multi-minute hangs
+        when the connection died on the first write)."""
         if self._client is None:
             raise RuntimeError("transport not entered")
         if timeout is None:
             timeout = self._response_timeout
         while not self._notify_queue.empty():
             self._notify_queue.get_nowait()
-
-        loop = asyncio.get_event_loop()
-        t_start = loop.time()
-        write_results = await asyncio.gather(
-            *(
-                self._client.write_gatt_char(
-                    WRITE_UUID, frame, response=write_response
-                )
-                for frame in frames
-            ),
-            return_exceptions=True,
-        )
-        for i, r in enumerate(write_results):
-            if isinstance(r, BaseException):
-                raise BleakError(
-                    f"pipeline write {i + 1}/{len(frames)} "
-                    f"({frames[i][:2].hex()}) failed after "
-                    f"{(loop.time() - t_start) * 1000:.0f}ms: {r}"
-                ) from r
-        t_writes_done = loop.time()
-        _LOGGER.debug(
-            "Pipeline dispatched %d writes in %.0fms (write_response=%s)",
-            len(frames),
-            (t_writes_done - t_start) * 1000,
-            write_response,
-        )
-
-        results: list[bytes] = []
-        deadline = t_start + timeout
-        while len(results) < len(frames):
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                data = await asyncio.wait_for(
-                    self._notify_queue.get(), timeout=remaining
-                )
-            except asyncio.TimeoutError:
-                break
-            body = parse_frame(data)
-            _LOGGER.debug(
-                "Pipeline notify %d/%d at +%.0fms: %s",
-                len(results) + 1,
-                len(frames),
-                (loop.time() - t_start) * 1000,
-                body[:2].hex(),
+        await self._client.write_gatt_char(WRITE_UUID, frame, response=True)
+        try:
+            data = await asyncio.wait_for(
+                self._notify_queue.get(), timeout=timeout
             )
-            results.append(body)
-        _LOGGER.debug(
-            "Pipeline collected %d/%d responses in %.0fms (total %.0fms)",
-            len(results),
-            len(frames),
-            (loop.time() - t_writes_done) * 1000,
-            (loop.time() - t_start) * 1000,
-        )
-        return results
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"no notification within {timeout}s for write {frame.hex()}"
+            ) from e
+        return parse_frame(data)
 
 
 @asynccontextmanager
