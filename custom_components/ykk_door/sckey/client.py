@@ -153,7 +153,7 @@ class SCKClient:
         self, pin: str, name: str = "SCK"
     ) -> None:
         """Phase 1 of two-phase registration: fire the state-changing
-        writes inside the lock's ~200ms post-pair registration window.
+        writes inside the lock's ~250ms post-pair registration window.
 
         Pipelined fire-and-forget — we don't wait for notifications back
         (the lock can only return 2-3 of them in the window anyway, and
@@ -162,9 +162,13 @@ class SCKClient:
         before it disconnects.
 
         Frames (in dispatch order — relevant if the lock processes serially):
-          enter (0x8343)   → claim admin slot, lock beeps
-          RegisterPin      → commit PIN
-          RegisterName     → commit name
+          enter (0x8343)        → claim admin reg-mode slot, lock beeps
+          RequestSmartphoneId   → make the lock allocate our smartphone slot
+                                  (required before RegisterPin has somewhere
+                                  to write — the RN app's Step1 saga
+                                  invariably calls this before Step2's pin)
+          RegisterPin           → commit PIN against the allocated slot
+          RegisterName          → commit smartphone name
 
         After this returns the caller must tear down the transport
         (the lock will disc itself anyway around the same time) and
@@ -176,6 +180,7 @@ class SCKClient:
         """
         frames = [
             _build_enter_reg_mode(),
+            _build_request_smartphone_id(0),
             _build_register_pin(pin),
             _build_register_name(name),
         ]
