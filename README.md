@@ -7,6 +7,17 @@ Home Assistant custom integration for the YKK AP **Smart Control Key**
 
 Reverse-engineered protocol; not affiliated with YKK AP.
 
+## Status
+
+**Experimental.** The GATT registration handshake is still being
+shaken out against the SCK3025 firmware — the lock's post-pair
+window is tight, and registration may need a retry or two before all
+fields commit. If registration partially succeeds, the integration
+stores what it got and backfills missing fields (`AdvDataKey`,
+`lock_id`, `smartphone_id`) on the next authenticated GATT session
+(your first `lock` / `unlock` action). Lock / unlock and passive
+state decoding are stable once registration completes.
+
 ## What it does
 
 Two BLE roles with independently selectable adapters:
@@ -51,13 +62,24 @@ Copy `custom_components/ykk_door/` into your HA config's
    which handles commands (short-range). Leave both on **Auto** if you
    only have one adapter today; revisit via the integration's *Options*
    once an ESP32 `bluetooth_proxy` is online near the door.
-3. **Register**:
+3. **Pick a method**:
+   - **Live registration** (default) — runs the GATT handshake
+     against the lock to capture credentials. Needs the short-range
+     adapter physically near the lock and the lock in registration
+     mode.
+   - **Manual entry** — paste an `AdvDataKey`, `lock_id`, and PIN you
+     already extracted (e.g. via reverse engineering). Skips the
+     GATT round-trip entirely; useful while waiting on a near-door
+     `bluetooth_proxy` install.
+4. **Live registration**:
    - Make sure the short-range adapter is physically close to the lock.
    - Press the lock's physical registration button.
-   - Pick a 6-digit PIN and submit.
-   - The integration runs the full GATT registration handshake, captures
-     this lock's per-device advertising key (`AdvDataKey`), and stores
-     it in the config entry. Without that key, no decoded state.
+   - Pick a 6-digit PIN and submit immediately — the lock leaves
+     registration mode after a short window.
+   - The integration runs the registration handshake and stores
+     whatever credentials the lock returned. If the lock didn't
+     return every field in time, the missing fields are backfilled
+     automatically on your next `lock` / `unlock` action.
 
 ## Entities
 
