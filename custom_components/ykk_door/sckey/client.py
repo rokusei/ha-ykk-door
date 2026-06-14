@@ -154,12 +154,16 @@ class SCKClient:
     ) -> RegistrationResult:
         """Full admin-smartphone (managementPhone) enrollment, pipelined.
 
-        Builds all 9 frames upfront (enter + Step1×5 + Step2×2 + Step3×1)
-        and ships them through the transport pipeline so the entire sequence
-        fits in the lock's ~230ms post-pair window. Responses are validated
+        Builds 8 frames upfront (enter + Step1×5 + Step2×1 + Step3×1) and
+        ships them through the transport pipeline so the entire sequence
+        fits in the lock's ~220ms post-pair window. Responses are validated
         only after the full pipeline completes; if `enter` is rejected
-        (rc != 1) we still consume the rest of the pipeline, but the lock
-        rejects subsequent frames as well, so no state changes on the lock.
+        (rc != 1) the lock rejects subsequent frames anyway, so no lock
+        state actually changes.
+
+        The RN app's Step2 also reads the existing lock name via RequestName
+        purely to surface it in its UI. We drop that here — saves one BLE
+        conn event in the critical-path window.
 
         Wire sequence after pair+notify, all on the same link:
           enter (0x8343)  → ack 03 43 01 (lock beeps)
@@ -169,7 +173,6 @@ class SCKClient:
           RequestLockId   → 03 42 ...
           RequestSmartphoneId → 03 41 ...
           RegisterPin     → 03 12 ...
-          RequestName     → 03 23 ... (Step2 — read existing name, discarded)
           RegisterName    → 03 22 ... (Step3 — write the new name)
 
         Requires the lock to be in registration mode (press the physical
@@ -183,7 +186,6 @@ class SCKClient:
             _build_request_lock_id(),
             _build_request_smartphone_id(0),
             _build_register_pin(pin),
-            _build_request_name(),
             _build_register_name(name),
         ]
         responses = await self._t.write_pipeline(frames)
@@ -210,8 +212,7 @@ class SCKClient:
         lock_id = lid_payload.split(b"\x00", 1)[0].decode("ascii")
         smartphone_id = self._check_ack(responses[5], 0x03, 0x41)
         self._check_ack(responses[6], 0x03, 0x12)  # RegisterPin
-        self._check_ack(responses[7], 0x03, 0x23)  # RequestName (discarded)
-        self._check_ack(responses[8], 0x03, 0x22)  # RegisterName
+        self._check_ack(responses[7], 0x03, 0x22)  # RegisterName
         return RegistrationResult(
             lock_id=lock_id,
             adv_data_key=adv_data_key,

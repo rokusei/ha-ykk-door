@@ -241,11 +241,27 @@ class SCKTransport:
                     self._notify_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError as e:
+                # Surface the partial responses so we can tell which
+                # commands the lock processed before disconnecting.
+                got_hex = (
+                    ", ".join(r[:2].hex() for r in results)
+                    if results
+                    else "(none)"
+                )
                 raise TimeoutError(
                     f"pipeline timeout: got {len(results)}/{len(frames)} "
-                    f"responses within {timeout}s"
+                    f"responses within {timeout}s "
+                    f"(received opcodes: {got_hex})"
                 ) from e
-            results.append(parse_frame(data))
+            body = parse_frame(data)
+            _LOGGER.debug(
+                "Pipeline notify %d/%d at +%.0fms: %s",
+                len(results) + 1,
+                len(frames),
+                (loop.time() - t_start) * 1000,
+                body[:2].hex(),
+            )
+            results.append(body)
         _LOGGER.debug(
             "Pipeline collected %d responses in %.0fms (total %.0fms)",
             len(results),
