@@ -149,69 +149,54 @@ class SCKClient:
         body = await self._send(_build_exit_reg_mode())
         self._check_ack(body, 0x03, 0x44)
 
-    async def register(
+    async def register_phase1_writes(
         self, pin: str, name: str = "SCK"
-    ) -> RegistrationResult:
-        """Admin-smartphone (managementPhone) enrollment, pipelined.
+    ) -> None:
+        """Phase 1 of two-phase registration: fire the state-changing
+        writes inside the lock's ~200ms post-pair registration window.
 
-        Trimmed from the full RN app saga to fit the lock's hard ~200ms
-        post-pair window: drops SetAppVersion (productCode=2 only — our
-        lock's productCode is unconfirmed, and 0.1.16 traces showed the
-        lock never returned a notify for opcode 0103) and SetTimestamp
-        (same — no 0102 notify ever observed). The lock also delivers
-        notifications out-of-order relative to the write sequence
-        (observed 0010 arriving before 0343), so we match responses by
-        opcode prefix rather than pipeline index.
+        Pipelined fire-and-forget — we don't wait for notifications back
+        (the lock can only return 2-3 of them in the window anyway, and
+        which ones come back is non-deterministic). The proxy queues all
+        writes and pushes them out; the lock processes whatever fits
+        before it disconnects.
 
-        Wire sequence after pair+notify (6 frames, all on the same link):
-          enter (0x8343)         → 03 43 01 (lock beeps)
-          RequestAdvDataKey      → 00 10 <16-byte key>
-          RequestLockId          → 03 42 ...
-          RequestSmartphoneId    → 03 41 ...
-          RegisterPin            → 03 12 ...
-          RegisterName           → 03 22 ...
+        Frames (in dispatch order — relevant if the lock processes serially):
+          enter (0x8343)   → claim admin slot, lock beeps
+          RegisterPin      → commit PIN
+          RegisterName     → commit name
+
+        After this returns the caller must tear down the transport
+        (the lock will disc itself anyway around the same time) and
+        re-establish a fresh authenticated connection for
+        ``register_phase2_reads``.
 
         Requires the lock to be in registration mode (press the physical
         button) at the time of the call.
         """
         frames = [
             _build_enter_reg_mode(),
-            _build_request_adv_data_key(),
-            _build_request_lock_id(),
-            _build_request_smartphone_id(0),
             _build_register_pin(pin),
             _build_register_name(name),
         ]
-        responses = await self._t.write_pipeline(frames)
-        # Match responses by opcode prefix — the lock delivers notifies
-        # out-of-order relative to write order. Each command has a unique
-        # 2-byte response prefix.
-        by_prefix = {bytes(r[:2]): r for r in responses}
+        await self._t.write_pipeline_fire(frames)
 
-        def _need(prefix: bytes) -> bytes:
-            body = by_prefix.get(prefix)
-            if body is None:
-                got = ", ".join(p.hex() for p in by_prefix)
-                raise RuntimeError(
-                    f"missing response for opcode {prefix.hex()} "
-                    f"(received: {got or 'none'})"
-                )
-            return body
+    async def register_phase2_reads(self, pin: str) -> RegistrationResult:
+        """Phase 2 of two-phase registration: pull the data we need to
+        operate the lock, on a fresh authenticated connection where the
+        post-pair watchdog no longer applies.
 
-        enter_payload = self._check_ack(_need(b"\x03\x43"), 0x03, 0x43)
-        rc = enter_payload[0] if enter_payload else 0
-        if rc != 1:
+        verify_pin authenticates this session against the PIN committed
+        in phase 1 — also a sanity check that phase 1 actually landed.
+        """
+        if not await self.verify_pin(pin):
             raise RuntimeError(
-                f"lock refused admin-smartphone registration (response code {rc})"
+                "PIN verification failed on phase-2 reconnect — phase 1 "
+                "writes did not commit. Retry registration."
             )
-        adv_data_key = self._check_ack(_need(b"\x00\x10"), 0x00, 0x10)[:16]
-        lid_payload = self._check_ack(_need(b"\x03\x42"), 0x03, 0x42)
-        if lid_payload and lid_payload[0] == 0x82:
-            lid_payload = lid_payload[1:]
-        lock_id = lid_payload.split(b"\x00", 1)[0].decode("ascii")
-        smartphone_id = self._check_ack(_need(b"\x03\x41"), 0x03, 0x41)
-        self._check_ack(_need(b"\x03\x12"), 0x03, 0x12)  # RegisterPin
-        self._check_ack(_need(b"\x03\x22"), 0x03, 0x22)  # RegisterName
+        lock_id = await self.request_lock_id()
+        smartphone_id = await self.request_smartphone_id()
+        adv_data_key = await self.request_adv_data_key()
         return RegistrationResult(
             lock_id=lock_id,
             adv_data_key=adv_data_key,

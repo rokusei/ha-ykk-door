@@ -166,6 +166,48 @@ class SCKTransport:
             ) from e
         return parse_frame(data)
 
+    async def write_pipeline_fire(
+        self, frames: list[bytes], *, settle: float = 0.3
+    ) -> None:
+        """Pipeline writes fire-and-forget — no notification waiting.
+
+        Used for the registration writes phase where the lock's hard
+        ~200ms post-pair window can't fit both the writes and their
+        notifications back. We dispatch all writes via gather +
+        write-without-response (so each returns immediately at the API
+        layer) and then sleep `settle` seconds for the proxy to flush
+        the BLE queue and the lock to commit state, before the caller
+        tears the connection down.
+
+        The lock may or may not process all writes — that's accepted.
+        Phase 2 (reads on a fresh connection) verifies state.
+        """
+        if self._client is None:
+            raise RuntimeError("transport not entered")
+        loop = asyncio.get_event_loop()
+        t_start = loop.time()
+        write_results = await asyncio.gather(
+            *(
+                self._client.write_gatt_char(WRITE_UUID, frame, response=False)
+                for frame in frames
+            ),
+            return_exceptions=True,
+        )
+        for i, r in enumerate(write_results):
+            if isinstance(r, BaseException):
+                raise BleakError(
+                    f"pipeline-fire write {i + 1}/{len(frames)} "
+                    f"({frames[i][:2].hex()}) failed after "
+                    f"{(loop.time() - t_start) * 1000:.0f}ms: {r}"
+                ) from r
+        _LOGGER.debug(
+            "Pipeline-fire dispatched %d writes in %.0fms, settling %.0fms",
+            len(frames),
+            (loop.time() - t_start) * 1000,
+            settle * 1000,
+        )
+        await asyncio.sleep(settle)
+
     async def write_pipeline(
         self,
         frames: list[bytes],

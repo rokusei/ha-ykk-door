@@ -24,6 +24,7 @@ unusual install paths.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import sys
@@ -393,15 +394,22 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     async def _run_registration(self, pin: str, name: str) -> dict[str, str]:
-        """Open a GATT connection (over the chosen short-range scanner) and
-        run the full registration handshake on it.
+        """Two-phase GATT registration.
 
-        Everything has to land on the same connection: the lock briefly
-        accepts data-exchange commands right after acking
-        EnterRegistrationModeAdminSmartphone (the beep) and tears the link
-        down soon after. Reconnects after that are treated as normal
-        sessions and the registration opcodes are silently ignored, so a
-        slow proxy / extra round-trip can blow the budget.
+        Phase 1: in the lock's brief post-pair window (~200ms over a BT
+        proxy), pipeline the state-changing writes — enter, RegisterPin,
+        RegisterName — fire-and-forget. The lock processes whatever
+        reaches it before its internal watchdog tears the link down; we
+        don't try to collect notification ACKs back in this window because
+        we can't reliably squeeze them through.
+
+        Phase 2: after the lock disconnects, reconnect (the bond should
+        be reused — observed `LTK USED INSTEAD OF STK` in the proxy logs)
+        and read back what we need to operate the lock: verify_pin
+        (authenticates + confirms phase 1 committed), lock_id,
+        smartphone_id, adv_data_key. The lock is no longer in registration
+        mode and the watchdog no longer applies, so these run sequentially
+        with no time pressure.
 
         Returns plain-str fields suitable for storing in the config entry.
         """
@@ -416,9 +424,24 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 "a bluetooth_proxy) closer to the lock and try again."
             )
 
+        # === Phase 1: writes inside the registration window
         async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
-            result = await client.register(pin, name=name)
+            await client.register_phase1_writes(pin, name=name)
+
+        # Brief pause: ESPHome proxy needs to free the BLE connection slot
+        # after the lock's own disconnect propagates through. ~7s was
+        # observed in the 0.1.11 traces; bleak_retry_connector retries
+        # internally so this is mostly a courtesy.
+        await asyncio.sleep(2.0)
+
+        # Re-resolve in case the BLE address rotated (RPAs do)
+        ble_device = self._pick_ble_device() or ble_device
+
+        # === Phase 2: authenticated reads on a fresh connection
+        async with SCKTransport(ble_device, response_timeout=10.0) as transport:
+            client = SCKClient(transport)
+            result = await client.register_phase2_reads(pin)
 
         return {
             "lock_id": result.lock_id,
