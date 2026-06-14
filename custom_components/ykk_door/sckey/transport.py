@@ -76,12 +76,14 @@ class SCKTransport:
         connect_timeout: float = 30.0,
         max_connect_attempts: int = 3,
         device_lookup: Callable[[], BLEDevice | None] | None = None,
+        skip_notify: bool = False,
     ):
         self._target = device
         self._response_timeout = response_timeout
         self._connect_timeout = connect_timeout
         self._max_attempts = max_connect_attempts
         self._device_lookup = device_lookup
+        self._skip_notify = skip_notify
         self._client: BleakClient | None = None
         self._notify_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -123,15 +125,19 @@ class SCKTransport:
             _LOGGER.debug("Pair complete")
         except (NotImplementedError, BleakError) as e:
             _LOGGER.debug("pair() not effective here, continuing: %s", e)
-        await self._client.start_notify(NOTIFY_UUID, self._on_notify)
+        if not self._skip_notify:
+            await self._client.start_notify(NOTIFY_UUID, self._on_notify)
+        else:
+            _LOGGER.debug("Skipping start_notify (fire-and-forget mode)")
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._client is not None and self._client.is_connected:
-            try:
-                await self._client.stop_notify(NOTIFY_UUID)
-            except Exception:
-                pass
+            if not self._skip_notify:
+                try:
+                    await self._client.stop_notify(NOTIFY_UUID)
+                except Exception:
+                    pass
             try:
                 await self._client.disconnect()
             except Exception:

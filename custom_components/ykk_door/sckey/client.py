@@ -186,15 +186,31 @@ class SCKClient:
         operate the lock, on a fresh authenticated connection where the
         post-pair watchdog no longer applies.
 
-        verify_pin authenticates this session against the PIN committed
-        in phase 1 — also a sanity check that phase 1 actually landed.
+        Sequence:
+          1. request_lock_id — probe that the lock is responsive on this
+             reconnected session at all. Times out only if the lock is
+             ignoring everything (broader issue than just PIN).
+          2. verify_pin — both authenticates this session and confirms
+             phase 1's RegisterPin actually committed. Returns False (NG)
+             rather than timing out if the PIN is wrong / unset.
+          3. request_smartphone_id, request_adv_data_key — fill in the
+             rest of the data the integration needs.
         """
+        try:
+            lock_id = await self.request_lock_id()
+        except TimeoutError as e:
+            raise RuntimeError(
+                "phase 2: lock did not respond to request_lock_id. Bond "
+                "may not be reused, or the lock requires another auth "
+                "step we are not sending."
+            ) from e
         if not await self.verify_pin(pin):
             raise RuntimeError(
-                "PIN verification failed on phase-2 reconnect — phase 1 "
-                "writes did not commit. Retry registration."
+                "phase 2: verify_pin returned NG — phase 1's RegisterPin "
+                "did not commit. Lock is responsive (got lock_id) but the "
+                "PIN we set is not the one the lock knows. Retry "
+                "registration."
             )
-        lock_id = await self.request_lock_id()
         smartphone_id = await self.request_smartphone_id()
         adv_data_key = await self.request_adv_data_key()
         return RegistrationResult(

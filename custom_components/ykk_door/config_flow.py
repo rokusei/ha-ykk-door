@@ -425,7 +425,13 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         # === Phase 1: writes inside the registration window
-        async with SCKTransport(ble_device, response_timeout=10.0) as transport:
+        # skip_notify=True drops the ~86ms start_notify CCCD write that
+        # otherwise eats most of the lock's ~243ms post-pair watchdog
+        # window before the pipeline-fire even starts. Phase 1 is
+        # fire-and-forget so a subscription buys nothing.
+        async with SCKTransport(
+            ble_device, response_timeout=10.0, skip_notify=True
+        ) as transport:
             client = SCKClient(transport)
             await client.register_phase1_writes(pin, name=name)
 
