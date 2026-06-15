@@ -9,9 +9,8 @@ Reverse-engineered protocol; not affiliated with YKK AP.
 
 ## Status
 
-**Experimental.** The GATT registration handshake is still being
-shaken out against the SCK3025 firmware — the lock's post-pair
-window is tight, and registration may need a retry or two before all
+Confirmed working against the SCK3025 firmware. The lock's post-pair
+window is tight, so registration may need a retry or two before all
 fields commit. If registration partially succeeds, the integration
 stores what it got and backfills missing fields (`AdvDataKey`,
 `lock_id`, `smartphone_id`) on the next authenticated GATT session
@@ -62,21 +61,19 @@ Copy `custom_components/ykk_door/` into your HA config's
    which handles commands (short-range). Leave both on **Auto** if you
    only have one adapter today; revisit via the integration's *Options*
    once an ESP32 `bluetooth_proxy` is online near the door.
-3. **Pick a method**:
-   - **Live registration** (default) — runs the GATT handshake
-     against the lock to capture credentials. Needs the short-range
-     adapter physically near the lock and the lock in registration
-     mode.
-   - **Manual entry** — paste an `AdvDataKey`, `lock_id`, and PIN you
-     already extracted (e.g. via reverse engineering). Skips the
-     GATT round-trip entirely; useful while waiting on a near-door
-     `bluetooth_proxy` install.
-4. **Live registration**:
+3. **Register**:
    - Make sure the short-range adapter is physically close to the lock.
-   - Press the lock's physical registration button.
+   - Put the lock into **smartphone registration mode**
+     (`スマートフォン登録モード`). Follow the manufacturer's instructions
+     for your model, or trigger it from an already-paired smartphone.
+     - **SCK3025**: remove the bottom cover, hold the registration
+       button, and lock/unlock the **bottom** thumb-turn twice (YKK
+       doors have two thumb-turns — the upper one will not work).
+       Wait for the lock to announce `スマートフォン登録モード`. Plain
+       `登録モード` is for physical keys and will not work.
    - Pick a 6-digit PIN and submit immediately — the lock leaves
      registration mode after a short window.
-   - The integration runs the registration handshake and stores
+   - The integration runs the GATT registration handshake and stores
      whatever credentials the lock returned. If the lock didn't
      return every field in time, the missing fields are backfilled
      automatically on your next `lock` / `unlock` action.
@@ -107,6 +104,27 @@ can see which scanner is doing what.
 - One connectable BLE adapter or `bluetooth_proxy` that can *reach*
   the lock (≤ ~3 m line-of-sight) for the short-range role. These can
   be the same adapter.
+
+## Troubleshooting
+
+- **Bluetooth error 133 during registration** — almost always a stale
+  pairing on the Home Assistant side (e.g. the lock was reset since you
+  last paired). SSH into Home Assistant and clear it:
+  ```
+  bluetoothctl remove <lock MAC>
+  ```
+  Then put the lock back into smartphone registration mode and retry.
+- **Registration times out** — the short-range adapter is too far from
+  the lock, or the lock is in the wrong registration mode (plain
+  `登録モード` instead of `スマートフォン登録モード`).
+- **State entity never updates** — check the `last_seen_via` attribute
+  on the `lock` entity to confirm a long-range scanner is hearing the
+  lock. RPA rotates every ~15 minutes; the integration matches on the
+  SCK manufacturer ID rather than MAC, so this should be transparent.
+
+If you're still stuck, please open an issue at
+[github.com/rokusei/ha-ykk-door/issues](https://github.com/rokusei/ha-ykk-door/issues)
+with the relevant Home Assistant logs.
 
 ## Security
 

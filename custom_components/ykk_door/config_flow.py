@@ -1,10 +1,11 @@
 """Config flow for YKK Smart Control Key.
 
-Four-step setup:
+Three-step setup:
 
 1. **bluetooth discovery / user pick** — HA's bluetooth integration
    auto-discovers SCK adverts by service UUID and invokes
-   ``async_step_bluetooth``; the manual flow lists nearby SCK devices.
+   ``async_step_bluetooth``; the user-initiated flow lists nearby SCK
+   devices.
 2. **adapters** — choose which scanner handles the long-range
    (state-listening) role and which handles the short-range (GATT
    read/write) role. Each defaults to ``auto``. You don't have to commit
@@ -14,7 +15,6 @@ Four-step setup:
    to press the physical button on the lock to enter registration mode.
    Submitting runs the GATT registration handshake — this is what captures
    the per-lock ``AdvDataKey`` the integration needs to decode adverts.
-4. (config entry created)
 
 The underlying sckey library uses bleak, which has no Android backend. We
 guard against running on Android and surface a clear error; HA Core itself
@@ -104,27 +104,6 @@ def _is_sck(service_info: BluetoothServiceInfoBleak) -> bool:
     return (service_info.name or "").upper().startswith("SCK")
 
 
-def _parse_adv_data_key(raw: str) -> bytes | None:
-    """Accept either 32 hex chars (separators allowed) or 16 ASCII bytes.
-
-    Returns the 16-byte key, or ``None`` on parse failure. Hex form wins
-    when the input has no whitespace/separators and is exactly 32 hex
-    chars; otherwise we fall back to raw bytes if the input encodes to
-    exactly 16 bytes.
-    """
-    stripped = "".join(c for c in raw if c not in " :-")
-    try:
-        candidate = bytes.fromhex(stripped)
-        if len(candidate) == 16:
-            return candidate
-    except ValueError:
-        pass
-    encoded = raw.encode("utf-8")
-    if len(encoded) == 16:
-        return encoded
-    return None
-
-
 def _scanner_choices(
     hass: HomeAssistant, address: str, *, connectable: bool
 ) -> dict[str, str]:
@@ -177,7 +156,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         }
         return await self.async_step_adapters()
 
-    # --- manual user start ----------------------------------------------
+    # --- user-initiated picker ------------------------------------------
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -221,7 +200,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._long_source = user_input[CONF_LONG_RANGE_SOURCE]
             self._short_source = user_input[CONF_SHORT_RANGE_SOURCE]
-            return await self.async_step_method()
+            return await self.async_step_register()
 
         long_choices = _scanner_choices(self.hass, self._address, connectable=False)
         short_choices = _scanner_choices(self.hass, self._address, connectable=True)
@@ -237,99 +216,6 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                     ): vol.In(short_choices),
                 }
             ),
-            description_placeholders={"address": self._address},
-        )
-
-    # --- method picker (live registration vs manual key entry) ----------
-    async def async_step_method(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Choose between a live GATT registration and pasting credentials.
-
-        Live registration only works when a connectable scanner is within
-        ~3 m of the lock and the lock is in registration mode. For users
-        who already have a lock's per-device ``AdvDataKey`` (e.g. extracted
-        during reverse engineering), the manual path skips the GATT trip
-        entirely and gets you straight to a working read-only entity —
-        useful while waiting for a near-door ESP32 ``bluetooth_proxy`` to
-        be installed.
-        """
-        if user_input is not None:
-            if user_input["method"] == "manual":
-                return await self.async_step_manual()
-            return await self.async_step_register()
-        return self.async_show_form(
-            step_id="method",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("method", default="register"): vol.In(
-                        {
-                            "register": "Live registration (lock must be in registration mode)",
-                            "manual": "Manual entry (I already have the AdvDataKey)",
-                        }
-                    ),
-                }
-            ),
-        )
-
-    # --- manual entry (expert mode) -------------------------------------
-    async def async_step_manual(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Accept the user-supplied AdvDataKey + lock_id + PIN directly.
-
-        Lock and unlock commands still require a connectable short-range
-        scanner at runtime; if none is configured yet, the read-only state
-        entity will still work — actions will simply error with
-        "not reachable" until a near-door scanner comes online.
-        """
-        errors: dict[str, str] = {}
-        assert self._address is not None
-
-        if user_input is not None:
-            adv_key = _parse_adv_data_key(user_input[CONF_ADV_DATA_KEY])
-            if adv_key is None:
-                errors[CONF_ADV_DATA_KEY] = "wrong_length"
-                adv_key = b""
-
-            lock_id = user_input[CONF_LOCK_ID].strip()
-            if len(lock_id) != 9 or not lock_id.isascii():
-                errors[CONF_LOCK_ID] = "invalid_lock_id"
-
-            pin = user_input[CONF_PIN]
-            if not pin.isdigit() or len(pin) != 6:
-                errors[CONF_PIN] = "invalid_pin"
-
-            if not errors:
-                return self.async_create_entry(
-                    title=f"YKK Lock {lock_id}",
-                    data={
-                        CONF_ADDRESS: self._address,
-                        CONF_PIN: pin,
-                        CONF_NAME: user_input.get(CONF_NAME, DEFAULT_NAME),
-                        CONF_LOCK_ID: lock_id,
-                        CONF_ADV_DATA_KEY: adv_key.hex(),
-                        CONF_SMARTPHONE_ID: "",
-                    },
-                    options={
-                        CONF_LONG_RANGE_SOURCE: self._long_source,
-                        CONF_SHORT_RANGE_SOURCE: self._short_source,
-                    },
-                )
-
-        info = self._discovered.get(self._address)
-        gap_name = _gap_name(info) or DEFAULT_NAME
-        return self.async_show_form(
-            step_id="manual",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_ADV_DATA_KEY): str,
-                    vol.Required(CONF_LOCK_ID): str,
-                    vol.Required(CONF_PIN, default="111111"): str,
-                    vol.Optional(CONF_NAME, default=gap_name): str,
-                }
-            ),
-            errors=errors,
             description_placeholders={"address": self._address},
         )
 
@@ -352,12 +238,27 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
                 result = await self._run_registration(pin, name)
             except TimeoutError:
                 errors["base"] = "timeout"
-            except RuntimeError as err:
-                _LOGGER.exception("SCK registration failed: %s", err)
-                errors["base"] = "registration_failed"
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Unexpected error during SCK registration")
-                errors["base"] = "unknown"
+            except Exception as err:  # noqa: BLE001
+                # Bluetooth GATT error 133 from the OS/proxy is almost always
+                # a stale bond on the HA side (lock was reset / re-registered
+                # since we last paired). Surface a specific recovery hint
+                # instead of the generic "registration_failed" so users don't
+                # waste retries on a fix that can only be applied via
+                # bluetoothctl.
+                if "133" in str(err):
+                    _LOGGER.warning(
+                        "SCK registration hit BLE error 133 (likely stale "
+                        "bond on %s): %s",
+                        self._address,
+                        err,
+                    )
+                    errors["base"] = "stale_bond"
+                elif isinstance(err, RuntimeError):
+                    _LOGGER.exception("SCK registration failed: %s", err)
+                    errors["base"] = "registration_failed"
+                else:
+                    _LOGGER.exception("Unexpected error during SCK registration")
+                    errors["base"] = "unknown"
             else:
                 title = (
                     f"YKK Lock {result['lock_id']}"

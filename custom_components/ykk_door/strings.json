@@ -17,26 +17,9 @@
           "short_range_source": "Short-range adapter (lock / unlock)"
         }
       },
-      "method": {
-        "title": "Registration method",
-        "description": "**Live registration** runs the full BLE handshake with the lock to capture this lock's unique advertising key. It requires a connectable Bluetooth scanner within ~3 m of the lock, and the lock to be in registration mode (physical button).\n\n**Manual entry** is for users who already have the `AdvDataKey` extracted by other means (e.g. reverse engineering). It skips the GATT round-trip entirely.",
-        "data": {
-          "method": "Method"
-        }
-      },
-      "manual": {
-        "title": "Manual credential entry",
-        "description": "Paste the values you already extracted for `{address}`.\n\n- **AdvDataKey** — 16 bytes. Either as 32 hex characters (separators ignored) **or** as the raw 16-byte ASCII string the lock generated.\n- **Lock ID** — 9-character ASCII identifier the lock embeds in `SetLockCommand` (e.g. `2024A0010001`-style).\n- **PIN** — 6 digits. Required to authenticate `lock` / `unlock` actions over GATT.",
-        "data": {
-          "adv_data_key": "AdvDataKey (32 hex chars or 16-byte ASCII)",
-          "lock_id": "Lock ID (9 chars)",
-          "pin": "PIN (6 digits)",
-          "name": "Smartphone name shown on the lock"
-        }
-      },
       "register": {
         "title": "Register with the lock",
-        "description": "About to register with **{name}** (`{address}`).\n\n1. Walk up to the lock so the Home Assistant Bluetooth adapter (or a nearby `bluetooth_proxy`) has line-of-sight (under ~3 m).\n2. **Press and hold the physical registration button on the lock** until it enters registration mode.\n3. Choose a 6-digit PIN below, then submit immediately — the lock leaves registration mode after a short window.\n\nThe handshake captures this lock's unique advertising key; without it, ongoing state cannot be decoded.",
+        "description": "About to register with **{name}** (`{address}`).\n\n1. Walk up to the lock so the Home Assistant Bluetooth adapter (or a nearby `bluetooth_proxy`) has line-of-sight (under ~3 m).\n2. **Put the lock into smartphone registration mode** (`スマートフォン登録モード`). Follow the manufacturer's instructions for your model, or trigger it from an already-paired smartphone. On the SCK3025: remove the bottom cover, hold the registration button, and lock/unlock the **bottom** thumb-turn twice (YKK doors have two — the upper one will not work) — the lock should announce `スマートフォン登録モード`. Plain `登録モード` is for physical keys and will not work here.\n3. Choose a 6-digit PIN below, then submit immediately — the lock leaves registration mode after a short window.\n\nThe handshake captures this lock's unique advertising key; without it, ongoing state cannot be decoded.",
         "data": {
           "pin": "PIN (6 digits)",
           "name": "Smartphone name shown on the lock"
@@ -44,17 +27,15 @@
       }
     },
     "abort": {
-      "no_devices_found": "No YKK SCK locks are currently advertising. Make sure HA's Bluetooth adapter (or a bluetooth_proxy) is close enough to the lock.",
+      "no_devices_found": "No YKK SCK locks are currently advertising.\n\nAn SCK lock that has never been paired with a smartphone stays silent on BLE — it only starts broadcasting once it's in registration mode (or already bonded). Put the lock into **smartphone registration mode** (`スマートフォン登録モード`) and retry.\n\nAlso confirm Home Assistant's Bluetooth adapter (or a `bluetooth_proxy`) is close enough to the lock.\n\nTo debug: *Settings → Devices & Services → Bluetooth → Advertisement monitor* and search by the lock's MAC prefix (e.g. `C2:46…` on the SCK3025; prefix varies by model). If the lock doesn't appear there, it's not reachable yet — it won't appear here either.",
       "already_configured": "This lock is already configured.",
       "unsupported_platform": "Home Assistant is running on a platform the underlying Bleak library does not support (Android). Use a Linux/macOS/Windows host or an ESPHome bluetooth_proxy."
     },
     "error": {
-      "registration_failed": "Registration failed. Make sure the lock is in registration mode (physical button) and try again.",
+      "registration_failed": "Registration failed. Make sure the lock is in smartphone registration mode (`スマートフォン登録モード`) and try again.",
       "timeout": "The lock did not respond in time. Move closer and retry while the lock is in registration mode.",
-      "wrong_length": "Must be exactly 16 bytes — either 32 hex characters, or a 16-character raw ASCII string.",
-      "invalid_lock_id": "Must be exactly 9 ASCII characters.",
-      "invalid_pin": "Must be exactly 6 digits.",
-      "unknown": "Unexpected error — check the Home Assistant logs."
+      "stale_bond": "Bluetooth error 133 — usually a stale pairing on the Home Assistant side (e.g. the lock was reset since you last paired). SSH into Home Assistant and clear it with:\n\n```\nbluetoothctl remove <lock MAC>\n```\n\nThen put the lock back into smartphone registration mode and retry. If you keep hitting this, please open an issue at https://github.com/rokusei/ha-ykk-door/issues.",
+      "unknown": "Unexpected error — check the Home Assistant logs. If it persists, please open an issue at https://github.com/rokusei/ha-ykk-door/issues."
     }
   },
   "options": {

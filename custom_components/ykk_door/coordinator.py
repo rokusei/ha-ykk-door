@@ -101,13 +101,10 @@ class SCKCoordinator:
         for the cached primer advert and then never again because each new
         RPA looks like a new device to HA's bluetooth manager.
 
-        RPA→identity resolution requires an OS-level BLE bond, which only
-        happens when the user goes through the live-registration flow.
-        Manual-entry users have no bond, so address matching is unusable for
-        them. Matching on manufacturer ID sidesteps the problem entirely;
-        adverts from other people's SCK locks (vanishingly unlikely but
-        possible in apartments) are filtered out by the decoder, since they
-        won't decrypt cleanly with our per-lock AdvDataKey.
+        Matching on manufacturer ID sidesteps the problem entirely; adverts
+        from other people's SCK locks (vanishingly unlikely but possible in
+        apartments) are filtered out by the decoder, since they won't decrypt
+        cleanly with our per-lock AdvDataKey.
 
         ``connectable=False`` keeps non-connectable scanners (a stretched-
         range proxy etc.) in the eligible set.
@@ -142,8 +139,10 @@ class SCKCoordinator:
                 service_info.manufacturer_data, self._adv_key
             )
         except ValueError as err:
-            # Wrong key / checksum mismatch — almost certainly someone else's
-            # SCK lock advertising on the same manufacturer ID. Silently skip.
+            # Decrypt / checksum mismatch on a full 22-byte payload — almost
+            # certainly someone else's SCK lock advertising on the same
+            # company ID. Short connection-request adverts are filtered by
+            # decode_advertisement itself, so they don't end up here.
             _LOGGER.debug(
                 "Adv from %s did not decrypt with our key: %s",
                 service_info.address,

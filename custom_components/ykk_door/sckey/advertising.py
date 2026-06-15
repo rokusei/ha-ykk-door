@@ -173,8 +173,16 @@ def decode_manufacturer_data(payload: bytes, adv_data_key: bytes) -> DecodedAdv:
 def decode_advertisement(manufacturer_data: dict[int, bytes], adv_data_key: bytes) -> DecodedAdv | None:
     """Convenience wrapper for the `advertisement_data.manufacturer_data` dict
     that BleakScanner delivers — returns None if the SCK company ID isn't
-    present in this advert."""
+    present in this advert, or if the payload is shorter than the 22-byte
+    state-advert block.
+
+    The lock broadcasts two AD variants under the same company ID: a 22-byte
+    encrypted state advert (decoded here) and a short connection-request
+    advert (typically 1 byte of manufacturer payload, e.g. `0x00`). The
+    short variant carries no state — return None so callers can treat it
+    as "nothing to do" rather than a decode error.
+    """
     payload = manufacturer_data.get(COMPANY_ID)
-    if payload is None:
+    if payload is None or len(payload) < 22:
         return None
     return decode_manufacturer_data(payload, adv_data_key)
