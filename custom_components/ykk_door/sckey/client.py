@@ -231,11 +231,23 @@ class SCKClient:
                 "RegisterPin did not ack within "
                 f"{FRAME_TIMEOUT}s. The lock probably disconnected before "
                 "processing the PIN write — registration did NOT complete. "
-                "Press the physical button again and retry. If this keeps "
-                "happening, the post-pair window is too tight for sequential "
-                "writes and we need to split into separate connections per "
-                "iOS-app Step1/Step2/Step3."
+                "Press the physical button again and retry."
             ) from e
+
+        # --- Step2 cont: read current name (iOS does this between PIN and
+        # RegisterName — line 287542 of decompiled.js). Without it, the
+        # lock silently dropped our RegisterName writes through v0.1.27.
+        # The response is the current name in UTF-16-BE, which iOS uses
+        # to prefill the UI; we don't care about the value, just that
+        # the lock processes it (which transitions it into "ready to
+        # accept a new name" state).
+        try:
+            body = await self._send(
+                _build_request_name(), timeout=FRAME_TIMEOUT
+            )
+            self._check_ack(body, 0x03, 0x23)
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning("RequestName did not return cleanly: %s", e)
 
         # --- Step3-equivalent: write name (best-effort, lock has us now) ---
         try:
