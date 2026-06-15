@@ -73,20 +73,36 @@ def register_pin(pin: str) -> bytes:
     return build_frame(_two(Cmd.REGISTER_PIN) + b"\x82" + digits)
 
 
-def set_lock_state(action: int, lock_id: str) -> bytes:
-    """action: 0x01 = lock, 0x02 = unlock. lock_id is the 9-char ASCII ID
-    returned by request_lock_id."""
+def set_lock_state(action: int, lock_id: str, smartphone_id_byte: int) -> bytes:
+    """Build SET_LOCK_STATE frame.
+
+    action: 0x01 = lock, 0x02 = unlock.
+    lock_id: 9-char ASCII ID returned by request_lock_id.
+    smartphone_id_byte: the slot byte the lock assigned during
+        registration. First byte of the RequestSmartphoneId response.
+        Per-registration value; different smartphones registered to the
+        same lock get different slot bytes. The lock silently refuses to
+        execute SetLockCommand if this byte doesn't match the bonded
+        peer's slot — no error notification, just no physical movement.
+
+    Frame body layout (decompiled.js generateRequestCommand line ~268550):
+      [action, smartphone_id_byte, ...lock_id_ascii_chars]
+    """
     if action not in (0x01, 0x02):
         raise ValueError(f"action must be 0x01 or 0x02, got 0x{action:02X}")
-    return build_frame(_two(Cmd.SET_LOCK_STATE) + bytes([action, 0x82]) + lock_id.encode("ascii"))
+    return build_frame(
+        _two(Cmd.SET_LOCK_STATE)
+        + bytes([action, smartphone_id_byte])
+        + lock_id.encode("ascii")
+    )
 
 
-def set_lock(lock_id: str) -> bytes:
-    return set_lock_state(0x01, lock_id)
+def set_lock(lock_id: str, smartphone_id_byte: int) -> bytes:
+    return set_lock_state(0x01, lock_id, smartphone_id_byte)
 
 
-def set_unlock(lock_id: str) -> bytes:
-    return set_lock_state(0x02, lock_id)
+def set_unlock(lock_id: str, smartphone_id_byte: int) -> bytes:
+    return set_lock_state(0x02, lock_id, smartphone_id_byte)
 
 
 def set_timestamp(when: _dt.datetime | None = None) -> bytes:

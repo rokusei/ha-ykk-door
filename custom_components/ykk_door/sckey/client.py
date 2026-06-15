@@ -107,15 +107,19 @@ class SCKClient:
         payload = self._check_ack(body, 0x03, 0x12)
         return bool(payload)
 
-    async def set_state(self, state: LockState, lock_id: str) -> LockState:
-        await self._send(_build_set_lock_state(int(state), lock_id))
+    async def set_state(
+        self, state: LockState, lock_id: str, smartphone_id_byte: int
+    ) -> LockState:
+        await self._send(
+            _build_set_lock_state(int(state), lock_id, smartphone_id_byte)
+        )
         return state
 
-    async def lock(self, lock_id: str) -> LockState:
-        return await self.set_state(LockState.LOCKED, lock_id)
+    async def lock(self, lock_id: str, smartphone_id_byte: int) -> LockState:
+        return await self.set_state(LockState.LOCKED, lock_id, smartphone_id_byte)
 
-    async def unlock(self, lock_id: str) -> LockState:
-        return await self.set_state(LockState.UNLOCKED, lock_id)
+    async def unlock(self, lock_id: str, smartphone_id_byte: int) -> LockState:
+        return await self.set_state(LockState.UNLOCKED, lock_id, smartphone_id_byte)
 
     # --- composite flows -------------------------------------------------
     async def enter_registration_mode_admin(self) -> int:

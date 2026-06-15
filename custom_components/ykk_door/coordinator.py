@@ -65,6 +65,14 @@ class SCKCoordinator:
         self._pin: str = entry.data[CONF_PIN]
         adv_hex: str = entry.data[CONF_ADV_DATA_KEY]
         self._adv_key: bytes = bytes.fromhex(adv_hex) if adv_hex else b""
+        # SetLockCommand needs the smartphone slot byte the lock assigned
+        # during registration (first byte of the RequestSmartphoneId
+        # response payload). Different per registration — hardcoding
+        # 0x82 from one capture caused silent execution refusal on
+        # other registrations (v0.1.29).
+        sid_hex: str = entry.data.get(CONF_SMARTPHONE_ID, "")
+        sid_bytes = bytes.fromhex(sid_hex) if sid_hex else b""
+        self._smartphone_id_byte: int = sid_bytes[0] if sid_bytes else 0x82
 
         self.latest: DecodedAdv | None = None
         self.last_rssi: int | None = None
@@ -200,7 +208,9 @@ class SCKCoordinator:
                         "lock_id is unknown and could not be read from the lock — "
                         "set_state requires it. Try the registration flow again."
                     )
-                await client.set_state(target_state, self.lock_id)
+                await client.set_state(
+                    target_state, self.lock_id, self._smartphone_id_byte
+                )
             if self.latest is not None:
                 self.latest = _replace_locked(self.latest, target_state)
             async_dispatcher_send(self.hass, self.signal)
@@ -267,8 +277,11 @@ class SCKCoordinator:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("smartphone_id backfill failed: %s", err)
             else:
+                sid_bytes = bytes(sid)
                 new_data = new_data or dict(self.entry.data)
-                new_data[CONF_SMARTPHONE_ID] = bytes(sid).hex()
+                new_data[CONF_SMARTPHONE_ID] = sid_bytes.hex()
+                if sid_bytes:
+                    self._smartphone_id_byte = sid_bytes[0]
                 _LOGGER.info("Backfilled smartphone_id from lock")
         if new_data is not None:
             self.hass.config_entries.async_update_entry(self.entry, data=new_data)
