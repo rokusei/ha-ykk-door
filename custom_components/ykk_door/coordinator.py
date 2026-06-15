@@ -162,15 +162,17 @@ class SCKCoordinator:
 
     # --- actions --------------------------------------------------------
     async def async_set_locked(self, locked: bool) -> None:
-        """Connect, verify PIN, set lock state. Updates self.latest optimistically.
+        """Connect, send SetTimestamp + SetLockState. Updates self.latest optimistically.
+
+        Mirrors the RN app's lock/unlock saga (decompiled.js ~266810):
+        requestConnection → SetTimestamp → SetLockCommand. Critically
+        **no verify_pin** — the PIN is enforced by the bond (registered
+        during registration), not as a wire-level auth step. v0.1.27
+        called verify_pin first and the lock silently dropped it,
+        causing a 5s timeout on every lock/unlock attempt.
 
         Uses the user's chosen short-range scanner when set, else lets HA
         pick the connectable scanner with the best RSSI.
-
-        On the first call after a partial registration, this also
-        backfills any missing credentials (adv_data_key, lock_id,
-        smartphone_id) that the lock didn't return notifies for during
-        the registration window — reusing the same authenticated session.
         """
         async with self._action_lock:
             ble_device = self._pick_connectable_ble_device()
@@ -182,9 +184,16 @@ class SCKCoordinator:
             target_state = LockState.LOCKED if locked else LockState.UNLOCKED
             async with SCKTransport(ble_device) as transport:
                 client = SCKClient(transport)
-                ok = await client.verify_pin(self._pin)
-                if not ok:
-                    raise RuntimeError("PIN rejected by lock")
+                # SetTimestamp preamble — matches iOS saga; the lock
+                # accepts SetLockCommand without it in some firmwares,
+                # but iOS always sends it and it costs ~144ms.
+                try:
+                    await client.set_timestamp()
+                except (TimeoutError, ValueError) as err:
+                    _LOGGER.debug(
+                        "SetTimestamp before action did not ack (continuing): %s",
+                        err,
+                    )
                 await self._backfill_if_needed(client)
                 if not self.lock_id:
                     raise RuntimeError(
@@ -218,17 +227,18 @@ class SCKCoordinator:
                 )
             async with SCKTransport(ble_device) as transport:
                 client = SCKClient(transport)
-                ok = await client.verify_pin(self._pin)
-                if not ok:
-                    raise RuntimeError("PIN rejected by lock")
+                try:
+                    await client.set_timestamp()
+                except (TimeoutError, ValueError) as err:
+                    _LOGGER.debug("SetTimestamp ack absent (continuing): %s", err)
                 await self._backfill_if_needed(client)
 
     async def _backfill_if_needed(self, client: SCKClient) -> None:
         """Fill in adv_data_key / lock_id / smartphone_id if absent.
 
-        Caller must hold ``_action_lock`` and have already verified the PIN
-        on ``client``. Persists any successfully-read values to the config
-        entry so the backfill is one-shot.
+        Caller must hold ``_action_lock`` and have an active bonded
+        transport on ``client``. Persists any successfully-read values
+        to the config entry so the backfill is one-shot.
         """
         new_data: dict | None = None
         if not self._adv_key:
