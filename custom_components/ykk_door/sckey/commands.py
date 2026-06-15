@@ -114,7 +114,11 @@ def request_name() -> bytes:
 
 
 def register_name(name: str) -> bytes:
-    return build_frame(_two(Cmd.REGISTER_NAME) + name.encode("utf-16-le"))
+    # UTF-16 big-endian: confirmed against Android HCI capture for "SCK"
+    # `83 22 00 53 00 43 00 4B B3 92` (matched lock ack `03 22 B3 83`).
+    # v0.1.x prior versions used utf-16-le which the lock silently dropped
+    # → RegisterName timeout → registration didn't finalize.
+    return build_frame(_two(Cmd.REGISTER_NAME) + name.encode("utf-16-be"))
 
 
 def request_adv_data_key() -> bytes:
