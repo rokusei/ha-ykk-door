@@ -130,25 +130,26 @@ class SCKClient:
     async def register(
         self, pin: str, name: str = "SCK"
     ) -> RegistrationResult:
-        """Admin-smartphone (managementPhone) enrollment, sequential per
-        iOS RN app saga (registerLockStep1/2/3, decompiled.js ~287100).
+        """Admin-smartphone (managementPhone) enrollment, sequential.
 
-        Two big differences from v0.1.17-0.1.23:
+        Matches the RN app's wire behavior (decompiled.js):
+        - `enterRegistrationMode` saga (~286077) sends 0x8343 FIRST,
+          on its own. This is what causes the lock to beep and claim
+          the admin smartphone slot. v0.1.24 dropped this based on a
+          misread of registerLockStep1; the lock then silently failed
+          to register us and stopped broadcasting. Confirmed against
+          hardware: no 0x8343 = no beep = no registration.
+        - `registerLockStep1` (~287105) follows with the data reads
+          (AdvDataKey, LockId, SmartphoneId).
+        - `registerLockStep2` writes the PIN.
+        - `registerLockStep3` writes the smartphone name.
 
-        1. **No EnterRegistrationModeAdminSmartphone (0x8343)**. The
-           iOS app's registerLockStep1 doesn't send it for admin
-           registration — the physical button press IS the
-           reg-mode-enter. Sending 0x8343 burned ~119ms of conn-event
-           budget for nothing, leaving the actually-important PIN/Name
-           writes to miss the lock's ~200ms post-pair window.
+        We do all of these sequentially on one BLE connection (the
+        Saga state machine in the app does too — it doesn't reconnect
+        between steps).
 
-        2. **Sequential writeAndWait** (not pipelined gather +
-           write-without-response). Each frame waits for its specific
-           ack before the next is sent — so the lock has a chance to
-           commit each command, and we know whether PIN actually
-           registered.
-
-        Wire sequence after pair+notify, all on one link:
+        Wire sequence after pair+notify:
+          enter (0x8343)         → 03 43 01  (MUST succeed; lock beeps)
           RequestAdvDataKey      → 00 10 <16-byte key>
           RequestLockId          → 03 42 ...
           RequestSmartphoneId    → 03 41 ...
@@ -156,15 +157,17 @@ class SCKClient:
           RegisterName           → 03 22 ...
 
         SetTimestamp (0x8102) and SetAppVersion (0x8103) are omitted —
-        the iOS app sends them but our lock never returns a notify, so
-        writeAndWait would hang. (Lock likely silently processes them
-        either way; they're not load-bearing for managementPhone.)
+        the RN app sends them but our lock never returns a notify, so
+        a writeAndWait would hang. (Lock probably processes them
+        silently anyway; not load-bearing for managementPhone.)
 
         Tolerant of read timeouts (AdvDataKey / LockId / SmartphoneId):
         if any read times out, the field comes back as None and the
         coordinator backfills lazily on the first authenticated
-        session. RegisterPin MUST succeed — without it the lock has no
-        record of us and would reject subsequent connections.
+        session. Enter and RegisterPin MUST succeed — without enter
+        the lock doesn't claim the slot; without PIN the bond has no
+        smartphone-slot binding and subsequent connections will be
+        rejected.
         """
         # 2s per-frame: healthy RTT to the lock is ~120ms; 2s leaves
         # generous slack for queueing/proxy WiFi jitter without
@@ -174,6 +177,29 @@ class SCKClient:
         adv_data_key: bytes | None = None
         lock_id: str | None = None
         smartphone_id: bytes | None = None
+
+        # --- Step 0: claim admin smartphone slot (the beep) ---
+        try:
+            body = await self._send(
+                _build_enter_reg_mode(), timeout=FRAME_TIMEOUT
+            )
+            payload = self._check_ack(body, 0x03, 0x43)
+            rc = payload[0] if payload else 0
+            if rc != 1:
+                raise RuntimeError(
+                    "lock refused EnterRegistrationModeAdminSmartphone "
+                    f"(response code {rc}). rc=2 typically means lock "
+                    "isn't in reg-mode (press the physical button); "
+                    "rc=3 means the admin slot is full and needs the "
+                    "current admin to be cleared first."
+                )
+        except TimeoutError as e:
+            raise RuntimeError(
+                "EnterRegistrationModeAdminSmartphone did not ack within "
+                f"{FRAME_TIMEOUT}s. The lock probably isn't in registration "
+                "mode (press the physical button) or isn't reachable. "
+                "No beep = lock never received the enter command."
+            ) from e
 
         # --- Step1-equivalent: reads ---
         try:
