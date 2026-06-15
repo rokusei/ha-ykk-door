@@ -132,41 +132,40 @@ class SCKClient:
     ) -> RegistrationResult:
         """Admin-smartphone (managementPhone) enrollment, sequential.
 
-        Matches the RN app's wire behavior (decompiled.js):
-        - `enterRegistrationMode` saga (~286077) sends 0x8343 FIRST,
-          on its own. This is what causes the lock to beep and claim
-          the admin smartphone slot. v0.1.24 dropped this based on a
-          misread of registerLockStep1; the lock then silently failed
-          to register us and stopped broadcasting. Confirmed against
-          hardware: no 0x8343 = no beep = no registration.
-        - `registerLockStep1` (~287105) follows with the data reads
-          (AdvDataKey, LockId, SmartphoneId).
-        - `registerLockStep2` writes the PIN.
-        - `registerLockStep3` writes the smartphone name.
+        Matches the RN app's wire behavior for first-time registration
+        (decompiled.js `registerLockStep1/2/3` sagas + the user's
+        Android HCI captures in `/media/claude/sckey/captures/`).
 
-        We do all of these sequentially on one BLE connection (the
-        Saga state machine in the app does too — it doesn't reconnect
-        between steps).
+        Findings settled v0.1.25 → v0.1.26:
+        - 0x8343 EnterRegistrationModeAdminSmartphone is NOT for
+          first-time registration. The iOS/Android app DOES NOT send
+          it on a freshly-cleared lock (no beep, registration still
+          works). It's for ADDING admin smartphones to an
+          already-registered lock — triggered from the in-app admin
+          menu. The physical button press is what enters reg-mode
+          for first registration. v0.1.25 sending it caused the lock
+          to disconnect ~400ms after ack, breaking the data exchange.
+        - SetTimestamp (0x8102) DOES ack on this lock — captured as
+          `01 02 F1 83` in the Android HCI dump. v0.1.17's "never
+          acks" observation was from a botched session, not normal
+          flow. Sending it first matches both iOS RN saga and the
+          captures.
 
         Wire sequence after pair+notify:
-          enter (0x8343)         → 03 43 01  (MUST succeed; lock beeps)
+          SetTimestamp           → 01 02
           RequestAdvDataKey      → 00 10 <16-byte key>
           RequestLockId          → 03 42 ...
           RequestSmartphoneId    → 03 41 ...
           RegisterPin            → 03 12 ...  (MUST succeed)
           RegisterName           → 03 22 ...
 
-        SetTimestamp (0x8102) and SetAppVersion (0x8103) are omitted —
-        the RN app sends them but our lock never returns a notify, so
-        a writeAndWait would hang. (Lock probably processes them
-        silently anyway; not load-bearing for managementPhone.)
+        SetAppVersion (0x8103) still omitted — only sent in iOS for
+        productCode==2 and our lock returns no notify for it.
 
-        Tolerant of read timeouts (AdvDataKey / LockId / SmartphoneId):
-        if any read times out, the field comes back as None and the
-        coordinator backfills lazily on the first authenticated
-        session. Enter and RegisterPin MUST succeed — without enter
-        the lock doesn't claim the slot; without PIN the bond has no
-        smartphone-slot binding and subsequent connections will be
+        Tolerant of read timeouts (SetTimestamp / AdvDataKey / LockId
+        / SmartphoneId): if any read times out, we log a warning and
+        continue. RegisterPin MUST succeed — without it the bond has
+        no smartphone-slot binding and subsequent connections will be
         rejected.
         """
         # 2s per-frame: healthy RTT to the lock is ~120ms; 2s leaves
@@ -178,28 +177,17 @@ class SCKClient:
         lock_id: str | None = None
         smartphone_id: bytes | None = None
 
-        # --- Step 0: claim admin smartphone slot (the beep) ---
+        # --- SetTimestamp first (matches RN saga for managementPhone) ---
+        # Best-effort: if the lock doesn't ack on this firmware, we
+        # continue. Captured 01-02 ack on `25D053025` confirms it
+        # normally does ack.
         try:
             body = await self._send(
-                _build_enter_reg_mode(), timeout=FRAME_TIMEOUT
+                _build_set_timestamp(), timeout=FRAME_TIMEOUT
             )
-            payload = self._check_ack(body, 0x03, 0x43)
-            rc = payload[0] if payload else 0
-            if rc != 1:
-                raise RuntimeError(
-                    "lock refused EnterRegistrationModeAdminSmartphone "
-                    f"(response code {rc}). rc=2 typically means lock "
-                    "isn't in reg-mode (press the physical button); "
-                    "rc=3 means the admin slot is full and needs the "
-                    "current admin to be cleared first."
-                )
-        except TimeoutError as e:
-            raise RuntimeError(
-                "EnterRegistrationModeAdminSmartphone did not ack within "
-                f"{FRAME_TIMEOUT}s. The lock probably isn't in registration "
-                "mode (press the physical button) or isn't reachable. "
-                "No beep = lock never received the enter command."
-            ) from e
+            self._check_ack(body, 0x01, 0x02)
+        except (TimeoutError, ValueError) as e:
+            _LOGGER.warning("SetTimestamp did not ack: %s", e)
 
         # --- Step1-equivalent: reads ---
         try:
