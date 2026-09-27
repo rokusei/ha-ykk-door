@@ -6,10 +6,13 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 
-from .const import DOMAIN
+from .const import CONF_LOCK_ID, DOMAIN
 from .coordinator import SCKCoordinator
+from .sckey.commands import sanitize_lock_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +21,7 @@ PLATFORMS: list[Platform] = [Platform.LOCK, Platform.BINARY_SENSOR, Platform.SEN
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up YKK SCK from a config entry."""
+    await _async_fix_lock_id(hass, entry)
     coordinator = SCKCoordinator(hass, entry)
     await coordinator.async_start()
 
@@ -25,6 +29,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+async def _async_fix_lock_id(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Strip trailing junk stored in lock_id by versions <= 0.2.0 (issue #1).
+
+    Entity unique_ids and the device identifier embed lock_id, so rewrite
+    those too rather than orphaning the old entities.
+    """
+    old = entry.data.get(CONF_LOCK_ID, "")
+    new = sanitize_lock_id(old)
+    if new == old:
+        return
+    _LOGGER.info("Sanitizing stored lock_id %r -> %r", old, new)
+
+    @callback
+    def _migrate(ent: er.RegistryEntry) -> dict | None:
+        if ent.unique_id.startswith(old):
+            return {"new_unique_id": new + ent.unique_id[len(old):]}
+        return None
+
+    await er.async_migrate_entries(hass, entry.entry_id, _migrate)
+
+    dev_reg = dr.async_get(hass)
+    if device := dev_reg.async_get_device(identifiers={(DOMAIN, old)}):
+        # Device name is refreshed from DeviceInfo when entities load.
+        dev_reg.async_update_device(device.id, new_identifiers={(DOMAIN, new)})
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_LOCK_ID: new},
+        title=entry.title.replace(old, new),
+    )
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:

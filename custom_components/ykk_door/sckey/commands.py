@@ -58,6 +58,27 @@ def request_lock_id() -> bytes:
     return build_frame(_two(Cmd.REQUEST_LOCK_ID))
 
 
+def sanitize_lock_id(raw: str) -> str:
+    """Keep the leading run of printable ASCII from a lock ID string.
+
+    The RequestLockId payload isn't always NUL-terminated: some locks
+    follow the 9-char ID with a 0x01 byte. Storing that byte made the
+    ID mismatch the advert-decoded one, so every advert was dropped and
+    the entity stayed unavailable (issue #1).
+    """
+    end = 0
+    while end < len(raw) and "\x21" <= raw[end] <= "\x7e":
+        end += 1
+    return raw[:end]
+
+
+def parse_lock_id(payload: bytes) -> str:
+    """Decode a RequestLockId response payload (0x82 marker + ASCII ID)."""
+    if payload and payload[0] == 0x82:
+        payload = payload[1:]
+    return sanitize_lock_id(payload.decode("latin-1"))
+
+
 def request_smartphone_id(slot: int = 0) -> bytes:
     return build_frame(_two(Cmd.REQUEST_SMARTPHONE_ID) + bytes([slot]))
 

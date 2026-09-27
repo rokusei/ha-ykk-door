@@ -1,7 +1,7 @@
 {
   "domain": "ykk_door",
   "name": "YKK Smart Control Key",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "codeowners": ["@rokusei"],
   "config_flow": true,
   "dependencies": ["bluetooth"],

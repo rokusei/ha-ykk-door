@@ -11,6 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 
 from .commands import (
     enter_registration_mode_admin as _build_enter_reg_mode,
+    parse_lock_id,
     exit_registration_mode_admin as _build_exit_reg_mode,
     register_name as _build_register_name,
     register_pin as _build_register_pin,
@@ -87,11 +88,7 @@ class SCKClient:
 
     async def request_lock_id(self) -> str:
         body = await self._send(_build_request_lock_id())
-        payload = self._check_ack(body, 0x03, 0x42)
-        if payload and payload[0] == 0x82:
-            payload = payload[1:]
-        ascii_part = payload.split(b"\x00", 1)[0]
-        return ascii_part.decode("ascii")
+        return parse_lock_id(self._check_ack(body, 0x03, 0x42))
 
     async def request_smartphone_id(self, slot: int = 0) -> bytes:
         body = await self._send(_build_request_smartphone_id(slot))
@@ -206,10 +203,7 @@ class SCKClient:
             body = await self._send(
                 _build_request_lock_id(), timeout=FRAME_TIMEOUT
             )
-            payload = self._check_ack(body, 0x03, 0x42)
-            if payload and payload[0] == 0x82:
-                payload = payload[1:]
-            lock_id = payload.split(b"\x00", 1)[0].decode("ascii")
+            lock_id = parse_lock_id(self._check_ack(body, 0x03, 0x42))
         except (TimeoutError, ValueError) as e:
             _LOGGER.warning("RequestLockId did not return cleanly: %s", e)
 
