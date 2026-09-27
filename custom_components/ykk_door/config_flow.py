@@ -43,6 +43,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ADDRESS,
@@ -301,17 +302,12 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _run_registration(self, pin: str, name: str) -> dict[str, str]:
         """Run the GATT registration handshake on a single connection.
 
-        Everything has to land on the same connection inside the lock's
-        ~200ms post-pair window: enter, RegisterPin/Name (writes), and
-        the RequestAdvDataKey/LockId/SmartphoneId reads. Reconnects burn
-        the registration window and the second pair() often fails on
-        backend bond reuse — single session is the reliable path.
+        Everything has to land on one connection: reconnects burn the
+        registration window and the second pair() often fails on backend
+        bond reuse. See ``SCKClient.register`` for the wire sequence.
 
-        Responses are partial — the lock typically returns a notify only
-        for ``enter`` plus a handful of the requests, never all six.
-        Whatever didn't come back is stored as ``""`` in the entry and
-        the coordinator backfills it on the first authenticated GATT
-        session (see ``SCKCoordinator.async_ensure_credentials``).
+        Any read the lock didn't answer is stored as ``""`` in the entry
+        and the coordinator backfills it on the next lock/unlock.
 
         Returns plain-str fields suitable for storing in the config entry.
         """
@@ -328,7 +324,7 @@ class SCKConfigFlow(ConfigFlow, domain=DOMAIN):
 
         async with SCKTransport(ble_device, response_timeout=10.0) as transport:
             client = SCKClient(transport)
-            result = await client.register(pin, name=name)
+            result = await client.register(pin, name=name, now=dt_util.now())
 
         return {
             "lock_id": result.lock_id or "",

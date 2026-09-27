@@ -33,7 +33,10 @@ class SCKLock(SCKEntity, LockEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.latest is not None
+        # Without the AdvDataKey no advert ever decodes, so ``latest`` stays
+        # None. Stay available anyway: HA skips service calls on unavailable
+        # entities, and the first lock/unlock is what backfills the key.
+        return self.coordinator.latest is not None or not self.coordinator.has_adv_key
 
     @property
     def extra_state_attributes(self) -> dict[str, str | int | None]:

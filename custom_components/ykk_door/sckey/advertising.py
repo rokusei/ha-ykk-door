@@ -159,7 +159,11 @@ def decode_manufacturer_data(payload: bytes, adv_data_key: bytes) -> DecodedAdv:
         lock_id_month=month,
         lock_id_day=day,
         lock_id_serial=serial,
-        locked=LockedState(plaintext[2]),
+        locked=(
+            LockedState(plaintext[2])
+            if plaintext[2] in LockedState._value2member_map_
+            else LockedState.NA
+        ),
         connection_request=bool(plaintext[3]),
         connection_request_destination=plaintext[4],
         lock_unit_fw=fw_hex(plaintext[5]),

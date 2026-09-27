@@ -28,14 +28,15 @@ import logging
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ADDRESS,
     CONF_ADV_DATA_KEY,
     CONF_LOCK_ID,
     CONF_LONG_RANGE_SOURCE,
-    CONF_PIN,
     CONF_SHORT_RANGE_SOURCE,
     CONF_SMARTPHONE_ID,
     DOMAIN,
@@ -62,7 +63,6 @@ class SCKCoordinator:
         # its post-pair window. They get backfilled lazily on the first
         # authenticated GATT session.
         self.lock_id: str = entry.data[CONF_LOCK_ID]
-        self._pin: str = entry.data[CONF_PIN]
         adv_hex: str = entry.data[CONF_ADV_DATA_KEY]
         self._adv_key: bytes = bytes.fromhex(adv_hex) if adv_hex else b""
         # SetLockCommand needs the smartphone slot byte the lock assigned
@@ -79,6 +79,10 @@ class SCKCoordinator:
         self.last_source: str | None = None
         self._unsub: CALLBACK_TYPE | None = None
         self._action_lock = asyncio.Lock()
+
+    @property
+    def has_adv_key(self) -> bool:
+        return bool(self._adv_key)
 
     @property
     def signal(self) -> str:
@@ -184,63 +188,46 @@ class SCKCoordinator:
         async with self._action_lock:
             ble_device = self._pick_connectable_ble_device()
             if ble_device is None:
-                raise RuntimeError(
+                raise HomeAssistantError(
                     f"Lock {self.address} is not currently reachable for a GATT "
                     "connection on the selected short-range adapter."
                 )
             target_state = LockState.LOCKED if locked else LockState.UNLOCKED
-            async with SCKTransport(ble_device) as transport:
-                client = SCKClient(transport)
-                # SetTimestamp preamble — matches iOS saga; the lock
-                # accepts SetLockCommand without it in some firmwares,
-                # but iOS always sends it and it costs ~144ms.
-                try:
-                    await client.set_timestamp()
-                except (TimeoutError, ValueError) as err:
-                    _LOGGER.debug(
-                        "SetTimestamp before action did not ack (continuing): %s",
-                        err,
-                    )
-                await self._backfill_if_needed(client)
-                if not self.lock_id:
-                    raise RuntimeError(
-                        "lock_id is unknown and could not be read from the lock — "
-                        "set_state requires it. Try the registration flow again."
-                    )
-                await client.set_state(
-                    target_state, self.lock_id, self._smartphone_id_byte
-                )
+            try:
+                await self._async_send_state(ble_device, target_state)
+            except HomeAssistantError:
+                raise
+            except Exception as err:
+                raise HomeAssistantError(
+                    f"{'Lock' if locked else 'Unlock'} failed: {err}"
+                ) from err
             if self.latest is not None:
                 self.latest = _replace_locked(self.latest, target_state)
             async_dispatcher_send(self.hass, self.signal)
 
-    async def async_ensure_credentials(self) -> None:
-        """Open an authenticated session and backfill any missing fields.
-
-        Useful for triggering a backfill outside of a lock/unlock action,
-        e.g. from a button entity or a setup-time best-effort task. No-op
-        if nothing is missing.
-        """
-        if self._adv_key and self.lock_id and self.entry.data.get(CONF_SMARTPHONE_ID):
-            return
-        async with self._action_lock:
-            if self._adv_key and self.lock_id and self.entry.data.get(
-                CONF_SMARTPHONE_ID
-            ):
-                return
-            ble_device = self._pick_connectable_ble_device()
-            if ble_device is None:
-                raise RuntimeError(
-                    f"Lock {self.address} is not currently reachable for a GATT "
-                    "connection on the selected short-range adapter."
+    async def _async_send_state(self, ble_device, target_state: LockState) -> None:
+        """One GATT session: SetTimestamp, backfill, SetLockState."""
+        async with SCKTransport(ble_device) as transport:
+            client = SCKClient(transport)
+            # SetTimestamp preamble — matches iOS saga; the lock
+            # accepts SetLockCommand without it in some firmwares,
+            # but iOS always sends it and it costs ~144ms.
+            try:
+                await client.set_timestamp(dt_util.now())
+            except (TimeoutError, ValueError) as err:
+                _LOGGER.debug(
+                    "SetTimestamp before action did not ack (continuing): %s",
+                    err,
                 )
-            async with SCKTransport(ble_device) as transport:
-                client = SCKClient(transport)
-                try:
-                    await client.set_timestamp()
-                except (TimeoutError, ValueError) as err:
-                    _LOGGER.debug("SetTimestamp ack absent (continuing): %s", err)
-                await self._backfill_if_needed(client)
+            await self._backfill_if_needed(client)
+            if not self.lock_id:
+                raise HomeAssistantError(
+                    "lock_id is unknown and could not be read from the lock — "
+                    "set_state requires it. Try the registration flow again."
+                )
+            await client.set_state(
+                target_state, self.lock_id, self._smartphone_id_byte
+            )
 
     async def _backfill_if_needed(self, client: SCKClient) -> None:
         """Fill in adv_data_key / lock_id / smartphone_id if absent.

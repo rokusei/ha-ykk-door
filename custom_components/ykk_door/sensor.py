@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 from homeassistant.core import HomeAssistant
@@ -60,6 +64,8 @@ class SCKHandleUnitFirmware(_DiagnosticSensor):
 
 class SCKRssi(_DiagnosticSensor):
     _attr_translation_key = "rssi"
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 
     def __init__(self, coordinator: SCKCoordinator) -> None:

@@ -37,9 +37,8 @@ class RegistrationResult:
     """Outcome of a registration handshake.
 
     Any of the read fields may be ``None`` when the lock did not return a
-    notification for that opcode inside its ~200ms post-pair window. The
-    coordinator backfills missing fields on the first authenticated GATT
-    session (see ``SCKCoordinator.async_ensure_credentials``).
+    notification for that opcode. The coordinator backfills missing
+    fields on the next lock/unlock (``SCKCoordinator._backfill_if_needed``).
     """
 
     lock_id: str | None
@@ -129,7 +128,7 @@ class SCKClient:
         self._check_ack(body, 0x03, 0x44)
 
     async def register(
-        self, pin: str, name: str = "SCK"
+        self, pin: str, name: str = "SCK", *, now: _dt.datetime | None = None
     ) -> RegistrationResult:
         """Admin-smartphone (managementPhone) enrollment, sequential.
 
@@ -184,7 +183,7 @@ class SCKClient:
         # normally does ack.
         try:
             body = await self._send(
-                _build_set_timestamp(), timeout=FRAME_TIMEOUT
+                _build_set_timestamp(now), timeout=FRAME_TIMEOUT
             )
             self._check_ack(body, 0x01, 0x02)
         except (TimeoutError, ValueError) as e:
@@ -231,6 +230,8 @@ class SCKClient:
                 "processing the PIN write — registration did NOT complete. "
                 "Press the physical button again and retry."
             ) from e
+        except ValueError as e:
+            raise RuntimeError(f"RegisterPin was rejected by the lock: {e}") from e
 
         # --- Step2 cont: read current name (iOS does this between PIN and
         # RegisterName — line 287542 of decompiled.js). Without it, the

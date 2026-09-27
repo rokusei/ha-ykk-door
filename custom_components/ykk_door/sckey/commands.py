@@ -29,9 +29,9 @@ class Cmd(IntEnum):
     SET_LOCK_STATE = 0x8003       # 3rd byte: 0x01 lock, 0x02 unlock
     SET_TIMESTAMP = 0x8102
     SET_APP_VERSION = 0x8103
-    # settings.registrationMode.{enter,exit}.adminSmartphone — must be the
-    # first frame sent once the lock is in its physical registration window;
-    # the lock silently ignores every other command until it accepts this.
+    # settings.registrationMode.{enter,exit}.adminSmartphone — for ADDING an
+    # admin smartphone to an already-registered lock. Do NOT send during
+    # first-time registration: the lock disconnects ~400ms after acking it.
     ENTER_REG_MODE_ADMIN_SMARTPHONE = 0x8343
     EXIT_REG_MODE_ADMIN_SMARTPHONE = 0x8344
     FW_UPDATE_REQUEST_LOCK = 0x8131
